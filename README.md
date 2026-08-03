@@ -62,6 +62,9 @@ observation and 14 actuator outputs. Its reference includes a small head nod,
 a brief airborne phase, and an absorbed landing. The scripted controller is
 useful for checking the exact reference without a trained checkpoint:
 
+See [JUMP_TRAINING.md](JUMP_TRAINING.md) for the complete remote-machine
+training, checkpoint evaluation, policy selection, and release workflow.
+
 ```bash
 uv run playground/open_duck_mini_v2/jump_infer.py --controller scripted
 ```
