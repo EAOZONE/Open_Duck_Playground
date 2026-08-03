@@ -4,6 +4,13 @@ from tensorflow.keras import layers
 import tf2onnx
 import numpy as np
 
+# ONNX export is small and does not need CUDA. Keeping TensorFlow on CPU avoids
+# competing with JAX for the GPU's cuBLAS/cuSolver workspace during training.
+try:
+    tf.config.set_visible_devices([], "GPU")
+except RuntimeError:
+    pass
+
 def export_onnx(
     params, act_size, ppo_params, obs_size, output_path="ONNX.onnx"
 ):

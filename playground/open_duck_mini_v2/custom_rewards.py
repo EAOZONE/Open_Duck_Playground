@@ -10,6 +10,7 @@ def reward_imitation(
     reference_frame: jax.Array,
     cmd: jax.Array,
     use_imitation_reward: bool = False,
+    contact_weight: float = 1.0,
 ) -> jax.Array:
     if not use_imitation_reward:
         return jp.nan_to_num(0.0)
@@ -17,15 +18,17 @@ def reward_imitation(
     # TODO don't reward for moving when the command is zero.
     cmd_norm = jp.linalg.norm(cmd[:3])
 
-    w_torso_pos = 1.0
+    # Keep the imitation term bounded and positive.  The environment sums all
+    # reward terms and clips the result at zero; an unbounded negative joint
+    # error therefore silences PPO's learning signal altogether.
     w_torso_orientation = 1.0
     w_lin_vel_xy = 1.0
     w_lin_vel_z = 1.0
     w_ang_vel_xy = 0.5
     w_ang_vel_z = 0.5
-    w_joint_pos = 15.0
-    w_joint_vel = 1.0e-3
-    w_contact = 1.0
+    w_joint_pos = 4.0
+    w_joint_vel = 0.5
+    w_contact = contact_weight
 
     #  TODO : double check if the slices are correct
     linear_vel_slice_start = 34
@@ -124,15 +127,17 @@ def reward_imitation(
         * w_ang_vel_z
     )
 
-    joint_pos_rew = -jp.sum(jp.square(joint_pos - ref_joint_pos)) * w_joint_pos
-    joint_vel_rew = -jp.sum(jp.square(joint_vel - ref_joint_vels)) * w_joint_vel
+    joint_pos_error = jp.mean(jp.square(joint_pos - ref_joint_pos))
+    joint_pos_rew = jp.exp(-10.0 * joint_pos_error) * w_joint_pos
+    joint_vel_error = jp.mean(jp.square(joint_vel - ref_joint_vels))
+    joint_vel_rew = jp.exp(-0.05 * joint_vel_error) * w_joint_vel
 
     ref_foot_contacts = jp.where(
         ref_foot_contacts > 0.5,
         jp.ones_like(ref_foot_contacts),
         jp.zeros_like(ref_foot_contacts),
     )
-    contact_rew = jp.sum(contacts == ref_foot_contacts) * w_contact
+    contact_rew = jp.mean((contacts == ref_foot_contacts).astype(jp.float32)) * w_contact
 
     reward = (
         lin_vel_xy_rew
@@ -142,7 +147,7 @@ def reward_imitation(
         + joint_pos_rew
         + joint_vel_rew
         + contact_rew
-        # + torso_orientation_rew
+        + torso_orientation_rew
     )
 
     reward *= cmd_norm > 0.01  # No reward for zero commands.

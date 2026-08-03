@@ -19,14 +19,15 @@ def reward_imitation(
     # TODO don't reward for moving when the command is zero.
     cmd_norm = np.linalg.norm(cmd[:3])
 
-    w_torso_pos = 1.0
+    # Match the JAX reward: bounded positive tracking terms are important here
+    # because the environment clips the total reward at zero.
     w_torso_orientation = 1.0
     w_lin_vel_xy = 1.0
     w_lin_vel_z = 1.0
     w_ang_vel_xy = 0.5
     w_ang_vel_z = 0.5
-    w_joint_pos = 15.0
-    w_joint_vel = 1.0e-3
+    w_joint_pos = 4.0
+    w_joint_vel = 0.5
     w_contact = 1.0
 
     #  TODO : double check if the slices are correct
@@ -126,15 +127,17 @@ def reward_imitation(
         * w_ang_vel_z
     )
 
-    joint_pos_rew = -np.sum(np.square(joint_pos - ref_joint_pos)) * w_joint_pos
-    joint_vel_rew = -np.sum(np.square(joint_vel - ref_joint_vels)) * w_joint_vel
+    joint_pos_error = np.mean(np.square(joint_pos - ref_joint_pos))
+    joint_pos_rew = np.exp(-10.0 * joint_pos_error) * w_joint_pos
+    joint_vel_error = np.mean(np.square(joint_vel - ref_joint_vels))
+    joint_vel_rew = np.exp(-0.05 * joint_vel_error) * w_joint_vel
 
     ref_foot_contacts = np.where(
         np.array(ref_foot_contacts) > 0.5,
         np.ones_like(ref_foot_contacts),
         np.zeros_like(ref_foot_contacts),
     )
-    contact_rew = np.sum(contacts == ref_foot_contacts) * w_contact
+    contact_rew = np.mean((contacts == ref_foot_contacts).astype(np.float32)) * w_contact
 
     reward = (
         lin_vel_xy_rew
@@ -144,7 +147,7 @@ def reward_imitation(
         + joint_pos_rew
         + joint_vel_rew
         + contact_rew
-        # + torso_orientation_rew
+        + torso_orientation_rew
     )
 
     reward *= cmd_norm > 0.01  # No reward for zero commands.

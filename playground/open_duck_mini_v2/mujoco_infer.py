@@ -15,13 +15,41 @@ USE_MOTOR_SPEED_LIMITS = True
 
 
 class MjInfer(MJInferBase):
+    COMMANDS_RANGE_X = [-0.20, 0.20]
+    COMMANDS_RANGE_Y = [-0.2, 0.2]
+    COMMANDS_RANGE_THETA = [-1.0, 1.0]
+    # The useful walking gait is near the top of the trained forward-command
+    # range. The final clip below keeps an overdriven stick in-distribution,
+    # while making about 80% forward stick reach the trained walking command.
+    XBOX_FORWARD_GAIN = 1.25
+    DEFAULT_LATCHED_FORWARD_SPEED = 0.20
+
     def __init__(
-        self, model_path: str, reference_data: str, onnx_model_path: str, standing: bool
+        self,
+        model_path: str,
+        reference_data: str,
+        onnx_model_path: str,
+        standing: bool,
+        policy_only: bool = False,
+        xbox_controller: bool = False,
+        fixed_command: tuple[float, float, float] | None = None,
+        latched_walk: bool = False,
+        latched_forward_speed: float = DEFAULT_LATCHED_FORWARD_SPEED,
     ):
         super().__init__(model_path)
 
         self.standing = standing
+        self.policy_only = policy_only
+        self.use_xbox_controller = xbox_controller
+        self.fixed_command = fixed_command
+        self.latched_walk = latched_walk
+        self.latched_forward_speed = float(latched_forward_speed)
+        self._latched_forward_command = 0.0
         self.head_control_mode = self.standing
+        self._pygame = None
+        self._xbox = None
+        self._last_controller_command = None
+        self._last_controller_report = 0.0
 
         # Params
         self.linearVelocityScale = 1.0
@@ -32,12 +60,12 @@ class MjInfer(MJInferBase):
 
         self.action_filter = LowPassActionFilter(50, cutoff_frequency=37.5)
 
-        if not self.standing:
+        if not self.standing and not self.policy_only:
             self.PRM = PolyReferenceMotion(reference_data)
 
         self.policy = OnnxInfer(onnx_model_path, awd=True)
 
-        self.COMMANDS_RANGE_X = [-0.15, 0.15]
+        self.COMMANDS_RANGE_X = [-0.20, 0.20]
         self.COMMANDS_RANGE_Y = [-0.2, 0.2]
         self.COMMANDS_RANGE_THETA = [-1.0, 1.0]  # [-1.0, 1.0]
 
@@ -64,6 +92,118 @@ class MjInfer(MJInferBase):
         print(f"backlash joint names: {self.backlash_joint_names}")
         # print(f"actual joints idx: {self.get_actual_joints_idx()}")
 
+    @staticmethod
+    def _deadzone(value: float, threshold: float = 0.1) -> float:
+        """Remove stick drift and rescale the useful range to [-1, 1]."""
+        if abs(value) <= threshold:
+            return 0.0
+        sign = 1.0 if value > 0.0 else -1.0
+        return sign * (abs(value) - threshold) / (1.0 - threshold)
+
+    def _init_xbox_controller(self) -> None:
+        import pygame
+
+        pygame.init()
+        pygame.joystick.init()
+        if pygame.joystick.get_count() == 0:
+            pygame.quit()
+            raise RuntimeError(
+                "No Xbox controller detected. Connect it and verify it appears "
+                "under /dev/input before retrying."
+            )
+
+        self._pygame = pygame
+        self._xbox = pygame.joystick.Joystick(0)
+        self._xbox.init()
+        pygame.display.set_mode((320, 80))
+        pygame.display.set_caption("Open Duck Xbox Controller")
+        print(
+            f"Xbox controller: {self._xbox.get_name()} "
+            f"({self._xbox.get_numaxes()} axes, {self._xbox.get_numbuttons()} buttons)"
+        )
+
+    @classmethod
+    def _xbox_command_from_input(
+        cls,
+        axes: list[float],
+        buttons: list[int],
+        hat: tuple[int, int] = (0, 0),
+    ) -> np.ndarray:
+        """Convert SDL's raw Xbox values into the trained 3-D command."""
+
+        def axis(index: int) -> float:
+            if index >= len(axes):
+                return 0.0
+            return cls._deadzone(float(axes[index]))
+
+        # SDL's Xbox mapping for the controller used on Linux is:
+        # left stick Y = 1 and right stick X = 3.
+        left_y = axis(1)
+        right_x = axis(3)
+
+        # On this Generic X-Box pad, physically pushing the left stick forward
+        # reports a positive SDL Y value.
+        lin_vel_x = left_y * cls.COMMANDS_RANGE_X[1] * cls.XBOX_FORWARD_GAIN
+
+        command = np.array(
+            [lin_vel_x, 0.0, right_x * cls.COMMANDS_RANGE_THETA[1]],
+            dtype=np.float32,
+        )
+        command[0] = np.clip(command[0], *cls.COMMANDS_RANGE_X)
+        command[1] = np.clip(command[1], *cls.COMMANDS_RANGE_Y)
+        command[2] = np.clip(command[2], *cls.COMMANDS_RANGE_THETA)
+
+        # A is an explicit stop/dead-man command.
+        if buttons and buttons[0]:
+            command[:] = 0.0
+        return command
+
+    def _update_xbox_command(self) -> None:
+        """Map an Xbox controller to the joystick command observation."""
+        self._pygame.event.pump()
+
+        axes = [
+            self._xbox.get_axis(i) for i in range(self._xbox.get_numaxes())
+        ]
+        buttons = [
+            self._xbox.get_button(i) for i in range(self._xbox.get_numbuttons())
+        ]
+        hat = self._xbox.get_hat(0) if self._xbox.get_numhats() else (0, 0)
+        command = self._xbox_command_from_input(axes, buttons, hat)
+        if self.fixed_command is not None:
+            command = np.asarray(self.fixed_command, dtype=np.float32)
+        elif self.latched_walk:
+            # A forward/backward stick flick selects a full-speed walk and
+            # keeps it active after the stick returns to center. A stops.
+            if buttons and buttons[0]:
+                self._latched_forward_command = 0.0
+            elif command[0] > 0.01:
+                self._latched_forward_command = self.latched_forward_speed
+            elif command[0] < -0.01:
+                self._latched_forward_command = -self.latched_forward_speed
+            command[0] = self._latched_forward_command
+        else:
+            # Normal Xbox mode is straight-walk only; do not use right-stick
+            # yaw unless latched mode was explicitly requested.
+            command[2] = 0.0
+        self.commands[:3] = command.tolist()
+
+        # This policy was trained with zero head commands for the basic walk
+        # experiment. The head remains neutral while using the controller.
+        self.commands[3:] = [0.0, 0.0, 0.0, 0.0]
+
+        # Make it obvious that input is reaching the policy.  This reports
+        # only changes, so it does not flood the terminal during inference.
+        now = time.monotonic()
+        command_tuple = tuple(float(value) for value in np.round(command, 3))
+        if (
+            command_tuple != self._last_controller_command
+            and now - self._last_controller_report > 0.1
+        ):
+            print(f"Xbox command: {command_tuple}")
+            self._last_controller_command = command_tuple
+            self._last_controller_report = now
+
     def get_obs(
         self,
         data,
@@ -71,7 +211,8 @@ class MjInfer(MJInferBase):
     ):
         gyro = self.get_gyro(data)
         accelerometer = self.get_accelerometer(data)
-        accelerometer[0] += 1.3
+        # Keep this consistent with the current training environment.  The
+        # JAX .at[...] expression there is not assigned, so no offset is used.
 
         joint_angles = self.get_actuator_joints_qpos(data.qpos)
         joint_vel = self.get_actuator_joints_qvel(data.qvel)
@@ -104,6 +245,14 @@ class MjInfer(MJInferBase):
 
     def key_callback(self, keycode):
         print(f"key: {keycode}")
+        # Do not let a viewer key event clear or replace a live controller
+        # command. Controller input is sampled every policy tick instead.
+        if self.use_xbox_controller:
+            if keycode == 80:  # p
+                self.phase_frequency_factor += 0.1
+            elif keycode == 59:  # m
+                self.phase_frequency_factor -= 0.1
+            return
         if keycode == 72:  # h
             self.head_control_mode = not self.head_control_mode
         lin_vel_x = 0
@@ -154,6 +303,8 @@ class MjInfer(MJInferBase):
         self.commands[2] = ang_vel
 
     def run(self):
+        if self.use_xbox_controller:
+            self._init_xbox_controller()
         try:
             with mujoco.viewer.launch_passive(
                 self.model,
@@ -172,7 +323,12 @@ class MjInfer(MJInferBase):
                     counter += 1
 
                     if counter % self.decimation == 0:
-                        if not self.standing:
+                        if self.use_xbox_controller:
+                            self._update_xbox_command()
+                        elif self.fixed_command is not None:
+                            self.commands[:3] = list(self.fixed_command)
+                            self.commands[3:] = [0.0, 0.0, 0.0, 0.0]
+                        if not self.standing and not self.policy_only:
                             self.imitation_i += 1.0 * self.phase_frequency_factor
                             self.imitation_i = (
                                 self.imitation_i % self.PRM.nb_steps_in_period
@@ -239,6 +395,9 @@ class MjInfer(MJInferBase):
                         time.sleep(time_until_next_step)
         except KeyboardInterrupt:
             pickle.dump(self.saved_obs, open("mujoco_saved_obs.pkl", "wb"))
+        finally:
+            if self._pygame is not None:
+                self._pygame.quit()
 
 
 if __name__ == "__main__":
@@ -257,10 +416,46 @@ if __name__ == "__main__":
         default="playground/open_duck_mini_v2/xmls/scene_flat_terrain.xml",
     )
     parser.add_argument("--standing", action="store_true", default=False)
+    parser.add_argument(
+        "--no-imitation-reward",
+        action="store_true",
+        help="Keep gait-phase inputs at zero for a policy trained without imitation.",
+    )
+    parser.add_argument(
+        "--xbox-controller",
+        action="store_true",
+        help="Use the first connected Xbox controller for movement commands.",
+    )
+    parser.add_argument(
+        "--fixed-command",
+        nargs=3,
+        type=float,
+        metavar=("X", "Y", "THETA"),
+        help="Use a fixed trained command instead of the Xbox input.",
+    )
+    parser.add_argument(
+        "--latched-walk",
+        action="store_true",
+        help="Latch forward/reverse walking until A is pressed; right stick turns.",
+    )
+    parser.add_argument(
+        "--latched-forward-speed",
+        type=float,
+        default=MjInfer.DEFAULT_LATCHED_FORWARD_SPEED,
+        help="Forward command used by latched walk mode (default: 0.20).",
+    )
 
     args = parser.parse_args()
 
     mjinfer = MjInfer(
-        args.model_path, args.reference_data, args.onnx_model_path, args.standing
+        model_path=args.model_path,
+        reference_data=args.reference_data,
+        onnx_model_path=args.onnx_model_path,
+        standing=args.standing,
+        policy_only=args.no_imitation_reward,
+        xbox_controller=args.xbox_controller,
+        fixed_command=tuple(args.fixed_command) if args.fixed_command else None,
+        latched_walk=args.latched_walk,
+        latched_forward_speed=args.latched_forward_speed,
     )
     mjinfer.run()

@@ -15,7 +15,9 @@
 # ==============================================================================
 """Joystick task for Open Duck Mini V2. (based on Berkeley Humanoid)"""
 
+from pathlib import Path
 from typing import Any, Dict, Optional, Union
+import os
 import jax
 import jax.numpy as jp
 from ml_collections import config_dict
@@ -38,15 +40,43 @@ from playground.common.rewards import (
     cost_action_rate,
     cost_stand_still,
     reward_alive,
+    cost_feet_height,
+    reward_feet_air_time,
 )
 from playground.open_duck_mini_v2.custom_rewards import reward_imitation
 
-# if set to false, won't require the reference data to be present and won't compute the reference motions polynoms for nothing
-USE_IMITATION_REWARD = True
+# These are environment-controlled so a training run can be policy-only without
+# editing source. The runner sets them from its CLI flags.
 USE_MOTOR_SPEED_LIMITS = True
 
 
+def _imitation_enabled() -> bool:
+    return os.environ.get("OPEN_DUCK_USE_IMITATION_REWARD", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _reference_motion_path() -> str:
+    return os.environ.get(
+        "OPEN_DUCK_REFERENCE_MOTION",
+        str(Path(__file__).resolve().parent / "data" / "polynomial_coefficients.pkl"),
+    )
+
+
+def _high_clearance_enabled() -> bool:
+    return os.environ.get("OPEN_DUCK_HIGH_CLEARANCE", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def default_config() -> config_dict.ConfigDict:
+    high_clearance = _high_clearance_enabled()
     return config_dict.create(
         ctrl_dt=0.02,
         sim_dt=0.002,
@@ -83,15 +113,19 @@ def default_config() -> config_dict.ConfigDict:
                 stand_still=-0.2,  # was -1.0 TODO try to relax this a bit ?
                 alive=20.0,
                 imitation=1.0,
+                feet_height=-4.0 if high_clearance else 0.0,
+                feet_air_time=1.0 if high_clearance else 0.0,
+                feet_lift=4.0 if high_clearance else 0.0,
             ),
             tracking_sigma=0.01,  # was working at 0.01
         ),
+        foot_height=0.045,
         push_config=config_dict.create(
             enable=True,
             interval_range=[5.0, 10.0],
             magnitude_range=[0.1, 1.0],
         ),
-        lin_vel_x=[-0.15, 0.15],
+        lin_vel_x=[-0.2, 0.2] if high_clearance else [-0.15, 0.15],
         lin_vel_y=[-0.2, 0.2],
         ang_vel_yaw=[-1.0, 1.0],  # [-1.0, 1.0]
         neck_pitch_range=[-0.34, 1.1],
@@ -125,9 +159,11 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             "home"
         ).ctrl  # ctrl of all the actual joints (no floating base and no backlash)
 
-        if USE_IMITATION_REWARD:
+        self.use_imitation_reward = _imitation_enabled()
+        self.high_clearance = _high_clearance_enabled()
+        if self.use_imitation_reward:
             self.PRM = PolyReferenceMotion(
-                "playground/open_duck_mini_v2/data/polynomial_coefficients.pkl"
+                _reference_motion_path()
             )
 
         # Note: First joint is freejoint.
@@ -268,7 +304,7 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         )
         push_interval_steps = jp.round(push_interval / self.dt).astype(jp.int32)
 
-        if USE_IMITATION_REWARD:
+        if self.use_imitation_reward:
             current_reference_motion = self.PRM.get_reference_motion(
                 cmd[0], cmd[1], cmd[2], 0
             )
@@ -322,7 +358,7 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
 
     def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
 
-        if USE_IMITATION_REWARD:
+        if self.use_imitation_reward:
             state.info["imitation_i"] += 1
             state.info["imitation_i"] = (
                 state.info["imitation_i"] % self.PRM.nb_steps_in_period
@@ -344,7 +380,7 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         else:
             state.info["imitation_i"] = 0
 
-        if USE_IMITATION_REWARD:
+        if self.use_imitation_reward:
             state.info["current_reference_motion"] = self.PRM.get_reference_motion(
                 state.info["command"][0],
                 state.info["command"][1],
@@ -427,8 +463,15 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 for geom_id in self._feet_geom_id
             ]
         )
-        contact_filt = contact | state.info["last_contact"]
-        first_contact = (state.info["feet_air_time"] > 0.0) * contact_filt
+        # Reward touchdown once per swing. Using `contact | last_contact` here
+        # makes first_contact stay true for the whole stance phase and causes
+        # the swing-peak reward to be evaluated repeatedly after the peak was
+        # reset.
+        first_contact = (
+            (state.info["feet_air_time"] > 0.0)
+            & contact
+            & ~state.info["last_contact"]
+        )
         state.info["feet_air_time"] += self.dt
         p_f = data.site_xpos[self._feet_site_id]
         p_fz = p_f[..., -1]
@@ -654,7 +697,8 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 contact,
                 info["current_reference_motion"],
                 info["command"],
-                USE_IMITATION_REWARD,
+                self.use_imitation_reward,
+                contact_weight=5.0 if self.high_clearance else 1.0,
             ),
             "stand_still": cost_stand_still(
                 # info["command"], data.qpos[7:], data.qvel[6:], self._default_pose
@@ -663,6 +707,28 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 self.get_actuator_joints_qvel(data.qvel),
                 self._default_actuator,
                 ignore_head=False,
+            ),
+            "feet_height": cost_feet_height(
+                info["swing_peak"],
+                first_contact,
+                self._config.foot_height,
+            ),
+            "feet_air_time": reward_feet_air_time(
+                info["feet_air_time"],
+                first_contact,
+                info["command"],
+            ),
+            "feet_lift": (
+                jp.sum(
+                    jp.clip(
+                        data.site_xpos[self._feet_site_id, -1],
+                        0.0,
+                        self._config.foot_height,
+                    )
+                    / self._config.foot_height
+                    * (~contact).astype(jp.float32)
+                )
+                * (jp.linalg.norm(info["command"][:3]) > 0.01)
             ),
         }
 

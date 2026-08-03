@@ -87,6 +87,15 @@ class BaseRunner(ABC):
         self.ppo_params = locomotion_params.brax_ppo_config(
             "BerkeleyHumanoidJoystickFlatTerrain"
         )  # TODO
+        # Keep task-specific episode horizons in sync with the environment.
+        # Walking currently uses the same 1000-step horizon as the default
+        # PPO config; the jump task intentionally ends after its recovery
+        # window.
+        self.ppo_params.episode_length = int(self.env._config.episode_length)
+        if getattr(self.args, "num_envs", None) is not None:
+            self.ppo_params.num_envs = int(self.args.num_envs)
+        if getattr(self.args, "num_evals", None) is not None:
+            self.ppo_params.num_evals = int(self.args.num_evals)
         self.ppo_training_params = dict(self.ppo_params)
         # self.ppo_training_params["num_timesteps"] = 150000000 * 20
         

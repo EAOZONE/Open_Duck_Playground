@@ -125,7 +125,11 @@ class MJInferBase:
         self.prev_motor_targets = self.default_actuator
 
         self.data.qpos[:] = self.model.keyframe("home").qpos
+        self.data.qvel[:] = 0
         self.data.ctrl[:] = self.default_actuator
+        # qpos is assigned after the initial model step above; refresh all
+        # derived quantities and sensors before the first policy observation.
+        mujoco.mj_forward(self.model, self.data)
 
     def get_actuator_id_from_name(self, name: str) -> int:
         """Return the id of a specified actuator"""

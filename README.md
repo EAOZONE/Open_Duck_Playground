@@ -38,6 +38,33 @@ Infer mujoco
 uv run playground/open_duck_mini_v2/mujoco_infer.py -o <path_to_.onnx>
 ```
 
+## Jump policy
+
+The jump environment trains a one-shot vertical hop with a 104-element
+observation and 14 actuator outputs. The scripted controller is useful for
+checking the motion without a trained checkpoint:
+
+```bash
+uv run playground/open_duck_mini_v2/jump_infer.py --controller scripted
+```
+
+Press `j` or Space in the MuJoCo viewer to request one jump. Train the PPO
+version with the same runner used by the walking tasks:
+
+```bash
+uv run playground/open_duck_mini_v2/runner.py \
+  --env jump --task flat_terrain \
+  --output_dir checkpoints/jump \
+  --num_timesteps 150000000
+```
+
+Run a trained jump ONNX policy with:
+
+```bash
+uv run playground/open_duck_mini_v2/jump_infer.py \
+  --controller onnx --onnx_model_path checkpoints/jump/<checkpoint>.onnx
+```
+
 # Documentation
 
 ## Project structure : 
