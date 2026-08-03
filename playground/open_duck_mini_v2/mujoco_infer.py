@@ -23,6 +23,8 @@ class MjInfer(MJInferBase):
     # while making about 80% forward stick reach the trained walking command.
     XBOX_FORWARD_GAIN = 1.25
     DEFAULT_LATCHED_FORWARD_SPEED = 0.20
+    DEFAULT_HEAD_BOBBLE_AMPLITUDE = 0.08
+    DEFAULT_STEP_BOUNCE_AMPLITUDE = 0.010
 
     def __init__(
         self,
@@ -35,6 +37,9 @@ class MjInfer(MJInferBase):
         fixed_command: tuple[float, float, float] | None = None,
         latched_walk: bool = False,
         latched_forward_speed: float = DEFAULT_LATCHED_FORWARD_SPEED,
+        expressive_walk: bool = False,
+        head_bobble_amplitude: float = DEFAULT_HEAD_BOBBLE_AMPLITUDE,
+        step_bounce_amplitude: float = DEFAULT_STEP_BOUNCE_AMPLITUDE,
     ):
         super().__init__(model_path)
 
@@ -44,6 +49,9 @@ class MjInfer(MJInferBase):
         self.fixed_command = fixed_command
         self.latched_walk = latched_walk
         self.latched_forward_speed = float(latched_forward_speed)
+        self.expressive_walk = expressive_walk
+        self.head_bobble_amplitude = float(head_bobble_amplitude)
+        self.step_bounce_amplitude = float(step_bounce_amplitude)
         self._latched_forward_command = 0.0
         self.head_control_mode = self.standing
         self._pygame = None
@@ -91,6 +99,27 @@ class MjInfer(MJInferBase):
         print(f"actuator names: {self.actuator_names}")
         print(f"backlash joint names: {self.backlash_joint_names}")
         # print(f"actual joints idx: {self.get_actual_joints_idx()}")
+
+    def _apply_expressive_style(self) -> None:
+        """Add small phase-locked character motion after policy inference."""
+        if not self.expressive_walk or self.standing or self.policy_only:
+            return
+
+        # The gait phase is [cos(theta), sin(theta)].  Keep the expression
+        # subtle and bounded so it cannot replace the learned leg controller.
+        phase_sin = float(self.imitation_phase[1])
+        bobble = self.head_bobble_amplitude * phase_sin
+        self.motor_targets[5] += 0.55 * bobble  # neck pitch
+        self.motor_targets[6] += bobble  # head pitch
+
+        # A small symmetric knee extension during the rising half of the
+        # cycle gives the duck a springy step without changing foot timing.
+        rise = max(0.0, phase_sin)
+        bounce = self.step_bounce_amplitude * rise
+        self.motor_targets[3] -= bounce
+        self.motor_targets[12] -= bounce
+        self.motor_targets[4] += 0.35 * bounce
+        self.motor_targets[13] += 0.35 * bounce
 
     @staticmethod
     def _deadzone(value: float, threshold: float = 0.1) -> float:
@@ -369,6 +398,8 @@ class MjInfer(MJInferBase):
                             self.default_actuator + action * self.action_scale
                         )
 
+                        self._apply_expressive_style()
+
                         if USE_MOTOR_SPEED_LIMITS:
                             self.motor_targets = np.clip(
                                 self.motor_targets,
@@ -444,6 +475,23 @@ if __name__ == "__main__":
         default=MjInfer.DEFAULT_LATCHED_FORWARD_SPEED,
         help="Forward command used by latched walk mode (default: 0.20).",
     )
+    parser.add_argument(
+        "--expressive-walk",
+        action="store_true",
+        help="Add a phase-locked head bobble and small springy step.",
+    )
+    parser.add_argument(
+        "--head-bobble-amplitude",
+        type=float,
+        default=MjInfer.DEFAULT_HEAD_BOBBLE_AMPLITUDE,
+        help="Head/neck bobble amplitude in radians (default: 0.08).",
+    )
+    parser.add_argument(
+        "--step-bounce-amplitude",
+        type=float,
+        default=MjInfer.DEFAULT_STEP_BOUNCE_AMPLITUDE,
+        help="Symmetric knee bounce amplitude in radians (default: 0.010).",
+    )
 
     args = parser.parse_args()
 
@@ -457,5 +505,8 @@ if __name__ == "__main__":
         fixed_command=tuple(args.fixed_command) if args.fixed_command else None,
         latched_walk=args.latched_walk,
         latched_forward_speed=args.latched_forward_speed,
+        expressive_walk=args.expressive_walk,
+        head_bobble_amplitude=args.head_bobble_amplitude,
+        step_bounce_amplitude=args.step_bounce_amplitude,
     )
     mjinfer.run()
