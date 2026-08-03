@@ -1,4 +1,4 @@
-"""MuJoCo PPO task for a one-shot Open Duck vertical jump."""
+"""MuJoCo PPO task for a one-shot Open Duck excited hop."""
 
 from __future__ import annotations
 
@@ -18,7 +18,9 @@ from playground.common.rewards import cost_action_rate, cost_torques
 from . import constants
 from . import base as open_duck_mini_v2_base
 from .jump_motion import (
+    FLIGHT_START,
     JUMP_DURATION,
+    LANDING_START,
     RECOVERY_START,
     clip_pose,
     phase_features,
@@ -423,13 +425,14 @@ class Jump(open_duck_mini_v2_base.OpenDuckMiniV2Env):
 
         root_height = data.qpos[self._floating_base_height_addr]
         height_delta = root_height - info["root_height_start"]
-        flight_phase = jp.clip((t - 0.55) / 0.50, 0.0, 1.0)
-        desired_height = 0.05 * jp.sin(flight_phase * jp.pi)
+        flight_duration = LANDING_START - FLIGHT_START
+        flight_phase = jp.clip((t - FLIGHT_START) / flight_duration, 0.0, 1.0)
+        desired_height = 0.04 * jp.sin(flight_phase * jp.pi)
         height = jp.exp(-jp.square(height_delta - desired_height) / 0.0009)
-        clearance = jp.clip(height_delta / 0.04, 0.0, 1.0)
+        clearance = jp.clip(height_delta / 0.035, 0.0, 1.0)
         desired_vertical_velocity = jp.where(
-            (t >= 0.55) & (t < 1.05),
-            0.05 * jp.pi / 0.50 * jp.cos(flight_phase * jp.pi),
+            (t >= FLIGHT_START) & (t < LANDING_START),
+            0.04 * jp.pi / flight_duration * jp.cos(flight_phase * jp.pi),
             0.0,
         )
         vertical_velocity = jp.exp(
@@ -438,7 +441,7 @@ class Jump(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         )
         airborne = (info["airborne_steps"] >= 3).astype(jp.float32)
         jump_failure = (
-            (t >= 0.55) & (~info["ever_airborne"])
+            (t >= LANDING_START) & (~info["ever_airborne"])
         ).astype(jp.float32)
         upright = jp.clip(self.get_gravity(data)[-1], 0.0, 1.0)
         global_angvel = self.get_global_angvel(data)

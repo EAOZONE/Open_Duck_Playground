@@ -1,4 +1,3 @@
-import mujoco
 import pickle
 import numpy as np
 import mujoco
@@ -10,6 +9,7 @@ from playground.common.poly_reference_motion_numpy import PolyReferenceMotion
 from playground.common.utils import LowPassActionFilter
 
 from playground.open_duck_mini_v2.mujoco_infer_base import MJInferBase
+from playground.open_duck_mini_v2.jump_motion import JumpMotionController
 
 USE_MOTOR_SPEED_LIMITS = True
 
@@ -23,8 +23,12 @@ class MjInfer(MJInferBase):
     # while making about 80% forward stick reach the trained walking command.
     XBOX_FORWARD_GAIN = 1.25
     DEFAULT_LATCHED_FORWARD_SPEED = 0.20
-    DEFAULT_HEAD_BOBBLE_AMPLITUDE = 0.08
-    DEFAULT_STEP_BOUNCE_AMPLITUDE = 0.010
+    DEFAULT_HEAD_BOBBLE_AMPLITUDE = 0.12
+    DEFAULT_ANTENNA_WIGGLE_AMPLITUDE = 0.10
+    DEFAULT_STEP_BOUNCE_AMPLITUDE = 0.018
+    HOP_SETTLE_DURATION = 0.4
+    HOP_RECOVERY_DURATION = 0.3
+    XBOX_HOP_BUTTON = 1  # B on the Linux SDL mapping used by this project.
 
     def __init__(
         self,
@@ -39,6 +43,7 @@ class MjInfer(MJInferBase):
         latched_forward_speed: float = DEFAULT_LATCHED_FORWARD_SPEED,
         expressive_walk: bool = False,
         head_bobble_amplitude: float = DEFAULT_HEAD_BOBBLE_AMPLITUDE,
+        antenna_wiggle_amplitude: float = DEFAULT_ANTENNA_WIGGLE_AMPLITUDE,
         step_bounce_amplitude: float = DEFAULT_STEP_BOUNCE_AMPLITUDE,
     ):
         super().__init__(model_path)
@@ -51,6 +56,7 @@ class MjInfer(MJInferBase):
         self.latched_forward_speed = float(latched_forward_speed)
         self.expressive_walk = expressive_walk
         self.head_bobble_amplitude = float(head_bobble_amplitude)
+        self.antenna_wiggle_amplitude = float(antenna_wiggle_amplitude)
         self.step_bounce_amplitude = float(step_bounce_amplitude)
         self._latched_forward_command = 0.0
         self.head_control_mode = self.standing
@@ -58,6 +64,7 @@ class MjInfer(MJInferBase):
         self._xbox = None
         self._last_controller_command = None
         self._last_controller_report = 0.0
+        self._hop_button_was_pressed = False
 
         # Params
         self.linearVelocityScale = 1.0
@@ -65,6 +72,11 @@ class MjInfer(MJInferBase):
         self.dof_pos_scale = 1.0
         self.dof_vel_scale = 0.05
         self.action_scale = 0.25
+
+        self.hop = JumpMotionController()
+        self.hop_requested = False
+        self.motion_mode = "walking"
+        self.settle_elapsed = 0.0
 
         self.action_filter = LowPassActionFilter(50, cutoff_frequency=37.5)
 
@@ -101,25 +113,140 @@ class MjInfer(MJInferBase):
         # print(f"actual joints idx: {self.get_actual_joints_idx()}")
 
     def _apply_expressive_style(self) -> None:
-        """Add small phase-locked character motion after policy inference."""
+        """Layer a bounded, excited character motion over the learned gait."""
         if not self.expressive_walk or self.standing or self.policy_only:
             return
 
-        # The gait phase is [cos(theta), sin(theta)].  Keep the expression
-        # subtle and bounded so it cannot replace the learned leg controller.
-        phase_sin = float(self.imitation_phase[1])
-        bobble = self.head_bobble_amplitude * phase_sin
-        self.motor_targets[5] += 0.55 * bobble  # neck pitch
-        self.motor_targets[6] += bobble  # head pitch
+        # Fade the flourish out with the movement command so the robot does
+        # not keep bobbling after it stops.  Full forward walk gets the full
+        # effect, while low-speed corrections retain a quieter version.
+        command_scale = max(
+            abs(float(self.commands[0])) / self.COMMANDS_RANGE_X[1],
+            abs(float(self.commands[1])) / self.COMMANDS_RANGE_Y[1],
+            abs(float(self.commands[2])) / self.COMMANDS_RANGE_THETA[1],
+        )
+        activity = float(np.clip(command_scale, 0.0, 1.0))
+        if activity <= 0.05:
+            return
+        activity = float(np.clip((activity - 0.05) / 0.45, 0.0, 1.0))
+        activity = activity * activity * (3.0 - 2.0 * activity)
 
-        # A small symmetric knee extension during the rising half of the
-        # cycle gives the duck a springy step without changing foot timing.
-        rise = max(0.0, phase_sin)
-        bounce = self.step_bounce_amplitude * rise
+        # The gait phase is [cos(theta), sin(theta)].  Its second harmonic
+        # produces one perk/bounce per footfall rather than only one per full
+        # left-right gait cycle.
+        phase_cos = float(self.imitation_phase[0])
+        phase_sin = float(self.imitation_phase[1])
+        phase_sin_2 = 2.0 * phase_sin * phase_cos
+        phase_cos_2 = phase_cos * phase_cos - phase_sin * phase_sin
+
+        nod = self.head_bobble_amplitude * activity * (
+            0.35 * phase_sin - 0.65 * phase_cos_2
+        )
+        self.motor_targets[5] += 0.50 * nod  # neck pitch
+        self.motor_targets[6] += nod  # head pitch
+
+        # The antennae are rigid meshes, not independently actuated joints.
+        # A quick head roll plus a gentler yaw makes the pair visibly wiggle
+        # without adding new dynamics or destabilizing the torso.
+        wiggle = self.antenna_wiggle_amplitude * activity
+        self.motor_targets[7] += 0.35 * wiggle * phase_sin  # head yaw
+        self.motor_targets[8] += wiggle * (
+            0.75 * phase_sin_2 + 0.25 * phase_cos
+        )  # head roll
+
+        # A small symmetric knee extension at each footfall makes the walk
+        # springy without altering the policy's left/right foot timing.
+        rise = 0.5 * (1.0 - phase_cos_2)
+        bounce = self.step_bounce_amplitude * activity * rise
         self.motor_targets[3] -= bounce
         self.motor_targets[12] -= bounce
         self.motor_targets[4] += 0.35 * bounce
         self.motor_targets[13] += 0.35 * bounce
+
+    def request_hop(self) -> bool:
+        """Queue one hop when the walking controller is available."""
+        if self.motion_mode != "walking" or self.hop_requested:
+            return False
+        self.hop_requested = True
+        return True
+
+    def _zero_movement_command(self) -> None:
+        """Stop translation and yaw while preserving the command layout."""
+        self.commands[:3] = [0.0, 0.0, 0.0]
+
+    def _reset_policy_history(self) -> None:
+        """Discard stale walking actions before returning from a hop."""
+        self.last_action[:] = 0.0
+        self.last_last_action[:] = 0.0
+        self.last_last_last_action[:] = 0.0
+
+    def _prepare_motion_step(self, dt: float) -> None:
+        """Advance non-pose state transitions before computing a target."""
+        if self.motion_mode == "walking" and self.hop_requested:
+            self.hop_requested = False
+            self.motion_mode = "settling"
+            self.settle_elapsed = 0.0
+            self._latched_forward_command = 0.0
+            print("Hop requested: stopping before takeoff")
+
+        if self.motion_mode != "walking":
+            self._zero_movement_command()
+
+        if self.motion_mode == "settling":
+            self.settle_elapsed += float(dt)
+            if self.settle_elapsed >= self.HOP_SETTLE_DURATION:
+                # A stale active clock should not normally be possible, but
+                # resetting it here makes repeated walk/hop cycles robust.
+                if not self.hop.request_jump():
+                    self.hop.reset()
+                    self.hop.request_jump()
+                self.motion_mode = "hopping"
+                self.settle_elapsed = 0.0
+                print("Hop started")
+        elif self.motion_mode == "recovering":
+            self.settle_elapsed += float(dt)
+            if self.settle_elapsed >= self.HOP_RECOVERY_DURATION:
+                self._reset_policy_history()
+                self.prev_motor_targets = self.default_actuator.copy()
+                self.motion_mode = "walking"
+                self.settle_elapsed = 0.0
+                print("Hop complete: walking controller restored")
+
+    def _target_for_motion_mode(
+        self, walking_target: np.ndarray | None, dt: float
+    ) -> np.ndarray:
+        """Select walking, hop, or recovery targets for this control tick."""
+        if self.motion_mode == "hopping":
+            target = self.hop.target(
+                self.default_actuator,
+                self.model.actuator_ctrlrange[:, 0],
+                self.model.actuator_ctrlrange[:, 1],
+            )
+            self.hop.advance(dt)
+            if not self.hop.active:
+                self.motion_mode = "recovering"
+                self.settle_elapsed = 0.0
+                print("Hop landed: recovering")
+            return target
+
+        if self.motion_mode == "recovering":
+            return self.default_actuator.copy()
+
+        if walking_target is None:
+            raise RuntimeError(
+                f"Walking target is required while motion mode is {self.motion_mode!r}"
+            )
+        return walking_target
+
+    def _update_hop_button(self, buttons: list[int]) -> None:
+        """Queue a hop on the rising edge of the Xbox B button."""
+        pressed = (
+            len(buttons) > self.XBOX_HOP_BUTTON
+            and bool(buttons[self.XBOX_HOP_BUTTON])
+        )
+        if pressed and not self._hop_button_was_pressed:
+            self.request_hop()
+        self._hop_button_was_pressed = pressed
 
     @staticmethod
     def _deadzone(value: float, threshold: float = 0.1) -> float:
@@ -197,6 +324,7 @@ class MjInfer(MJInferBase):
         buttons = [
             self._xbox.get_button(i) for i in range(self._xbox.get_numbuttons())
         ]
+        self._update_hop_button(buttons)
         hat = self._xbox.get_hat(0) if self._xbox.get_numhats() else (0, 0)
         command = self._xbox_command_from_input(axes, buttons, hat)
         if self.fixed_command is not None:
@@ -274,6 +402,9 @@ class MjInfer(MJInferBase):
 
     def key_callback(self, keycode):
         print(f"key: {keycode}")
+        if keycode in (74, 32):  # J or Space
+            self.request_hop()
+            return
         # Do not let a viewer key event clear or replace a live controller
         # command. Controller input is sampled every policy tick instead.
         if self.use_xbox_controller:
@@ -352,12 +483,20 @@ class MjInfer(MJInferBase):
                     counter += 1
 
                     if counter % self.decimation == 0:
+                        control_dt = self.sim_dt * self.decimation
                         if self.use_xbox_controller:
                             self._update_xbox_command()
                         elif self.fixed_command is not None:
                             self.commands[:3] = list(self.fixed_command)
                             self.commands[3:] = [0.0, 0.0, 0.0, 0.0]
-                        if not self.standing and not self.policy_only:
+
+                        self._prepare_motion_step(control_dt)
+
+                        if (
+                            self.motion_mode in ("walking", "settling")
+                            and not self.standing
+                            and not self.policy_only
+                        ):
                             self.imitation_i += 1.0 * self.phase_frequency_factor
                             self.imitation_i = (
                                 self.imitation_i % self.PRM.nb_steps_in_period
@@ -380,38 +519,55 @@ class MjInfer(MJInferBase):
                                     ),
                                 ]
                             )
-                        obs = self.get_obs(
-                            self.data,
-                            self.commands,
+
+                        walking_target = None
+                        if self.motion_mode in ("walking", "settling"):
+                            obs = self.get_obs(
+                                self.data,
+                                self.commands,
+                            )
+                            self.saved_obs.append(obs)
+                            action = self.policy.infer(obs)
+
+                            # self.action_filter.push(action)
+                            # action = self.action_filter.get_filtered_action()
+
+                            self.last_last_last_action = self.last_last_action.copy()
+                            self.last_last_action = self.last_action.copy()
+                            self.last_action = action.copy()
+
+                            self.motor_targets = (
+                                self.default_actuator + action * self.action_scale
+                            )
+                            if self.motion_mode == "walking":
+                                self._apply_expressive_style()
+                            walking_target = self.motor_targets.copy()
+
+                        self.motor_targets = self._target_for_motion_mode(
+                            walking_target, control_dt
                         )
-                        self.saved_obs.append(obs)
-                        action = self.policy.infer(obs)
 
-                        # self.action_filter.push(action)
-                        # action = self.action_filter.get_filtered_action()
-
-                        self.last_last_last_action = self.last_last_action.copy()
-                        self.last_last_action = self.last_action.copy()
-                        self.last_action = action.copy()
-
-                        self.motor_targets = (
-                            self.default_actuator + action * self.action_scale
+                        # The style layer is intentionally small, but keep
+                        # the final target inside the physical joint limits
+                        # even if a policy action is already near an edge.
+                        self.motor_targets = np.clip(
+                            self.motor_targets,
+                            self.model.actuator_ctrlrange[:, 0],
+                            self.model.actuator_ctrlrange[:, 1],
                         )
-
-                        self._apply_expressive_style()
 
                         if USE_MOTOR_SPEED_LIMITS:
                             self.motor_targets = np.clip(
                                 self.motor_targets,
                                 self.prev_motor_targets
                                 - self.max_motor_velocity
-                                * (self.sim_dt * self.decimation),
+                                * control_dt,
                                 self.prev_motor_targets
                                 + self.max_motor_velocity
-                                * (self.sim_dt * self.decimation),
+                                * control_dt,
                             )
 
-                            self.prev_motor_targets = self.motor_targets.copy()
+                        self.prev_motor_targets = self.motor_targets.copy()
 
                         # head_targets = self.commands[3:]
                         # self.motor_targets[5:9] = head_targets
@@ -478,19 +634,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--expressive-walk",
         action="store_true",
-        help="Add a phase-locked head bobble and small springy step.",
+        help="Add an excited two-beat head bobble, antenna wiggle, and springy step.",
     )
     parser.add_argument(
         "--head-bobble-amplitude",
         type=float,
         default=MjInfer.DEFAULT_HEAD_BOBBLE_AMPLITUDE,
-        help="Head/neck bobble amplitude in radians (default: 0.08).",
+        help="Head/neck bobble amplitude in radians (default: 0.12).",
+    )
+    parser.add_argument(
+        "--antenna-wiggle-amplitude",
+        type=float,
+        default=MjInfer.DEFAULT_ANTENNA_WIGGLE_AMPLITUDE,
+        help="Head roll used to visually wiggle the rigid antennae (default: 0.10).",
     )
     parser.add_argument(
         "--step-bounce-amplitude",
         type=float,
         default=MjInfer.DEFAULT_STEP_BOUNCE_AMPLITUDE,
-        help="Symmetric knee bounce amplitude in radians (default: 0.010).",
+        help="Symmetric knee bounce amplitude in radians (default: 0.018).",
     )
 
     args = parser.parse_args()
@@ -507,6 +669,7 @@ if __name__ == "__main__":
         latched_forward_speed=args.latched_forward_speed,
         expressive_walk=args.expressive_walk,
         head_bobble_amplitude=args.head_bobble_amplitude,
+        antenna_wiggle_amplitude=args.antenna_wiggle_amplitude,
         step_bounce_amplitude=args.step_bounce_amplitude,
     )
     mjinfer.run()

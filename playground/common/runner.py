@@ -59,11 +59,16 @@ class BaseRunner(ABC):
             # Convert to float, but watch out for 0-dim JAX arrays
             self.writer.add_scalar(metric_name, metric_value, num_steps)
 
-        print("-----------")
+        success = metrics.get("eval/episode_success_steps")
+        success_text = "" if success is None else f" success_steps: {success}"
+        print("-----------", flush=True)
         print(
-            f'STEP: {num_steps} reward: {metrics["eval/episode_reward"]} reward_std: {metrics["eval/episode_reward_std"]}'
+            f'STEP: {num_steps} reward: {metrics["eval/episode_reward"]} '
+            f'reward_std: {metrics["eval/episode_reward_std"]}'
+            f"{success_text}",
+            flush=True,
         )
-        print("-----------")
+        print("-----------", flush=True)
 
     def policy_params_fn(self, current_step, make_policy, params):
         # save checkpoints

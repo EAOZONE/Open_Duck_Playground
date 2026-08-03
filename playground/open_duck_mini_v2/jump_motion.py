@@ -1,4 +1,4 @@
-"""Shared trajectory and one-shot controller for Open Duck jumps."""
+"""Shared trajectory and one-shot controller for the Open Duck excited hop."""
 
 from __future__ import annotations
 
@@ -8,31 +8,46 @@ from typing import Any
 import numpy as np
 
 
-JUMP_DURATION = 2.0
-# The nominal Open Duck hop is shorter than the nominal 0.50 s ballistic
-# window.  Start absorption when the model actually approaches the floor.
-LANDING_START = 0.75
-RECOVERY_START = 1.05
+JUMP_DURATION = 1.4
+CROUCH_REACHED = 0.14
+TAKEOFF_START = 0.37
+FLIGHT_START = 0.52
+LANDING_START = 0.705
+RECOVERY_START = 0.925
 JUMP_PHASES = {
-    "crouch": (0.0, 0.30),
-    "takeoff": (0.30, 0.55),
-    "flight": (0.55, 1.05),
-    "landing": (LANDING_START, 1.05),
-    "recovery": (RECOVERY_START, 2.00),
+    "crouch": (0.0, TAKEOFF_START),
+    "takeoff": (TAKEOFF_START, FLIGHT_START),
+    "flight": (FLIGHT_START, LANDING_START),
+    "landing": (LANDING_START, RECOVERY_START),
+    "recovery": (RECOVERY_START, JUMP_DURATION),
 }
 
-# Actuator order is the order in open_duck_mini_v2.xml.  Head offsets remain
-# zero so the scripted and learned jump controllers keep the head at home.
+# Actuator order is the order in open_duck_mini_v2.xml.  The leg poses were
+# tuned against the MuJoCo model for a small, upright hop.  The head changes
+# are deliberately light: a quick nod and side-to-side tick make the motion
+# expressive without throwing appreciable angular momentum into the landing.
 CROUCH_OFFSETS = np.array(
-    [0.0, 0.0, 0.12, 0.45, -0.18, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.12, 0.45, 0.18],
+    [
+        0.0, 0.0, 0.042, 0.158, -0.063,
+        0.009, 0.015, 0.040, 0.030,
+        0.0, 0.0, -0.042, 0.158, 0.063,
+    ],
     dtype=np.float32,
 )
 TAKEOFF_OFFSETS = np.array(
-    [0.0, 0.0, -0.18, -0.55, 0.22, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.18, -0.55, -0.22],
+    [
+        0.0, 0.0, -0.116, -0.520, 0.025,
+        0.015, -0.024, -0.040, -0.030,
+        0.0, 0.0, 0.116, -0.520, -0.025,
+    ],
     dtype=np.float32,
 )
 FLIGHT_OFFSETS = np.array(
-    [0.0, 0.0, 0.05, 0.25, -0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.05, 0.25, 0.05],
+    [
+        0.0, 0.0, 0.010, 0.048, -0.010,
+        0.009, -0.012, 0.020, 0.015,
+        0.0, 0.0, -0.010, 0.048, 0.010,
+    ],
     dtype=np.float32,
 )
 
@@ -59,16 +74,24 @@ def trajectory_pose(time_s: Any, home_pose: Any, xp: Any = np) -> Any:
     flight = home_pose + xp.asarray(FLIGHT_OFFSETS, dtype=home_pose.dtype)
 
     t = xp.asarray(time_s)
-    home_to_crouch = _lerp(home_pose, crouch, t / 0.15, xp)
+    home_to_crouch = _lerp(home_pose, crouch, t / CROUCH_REACHED, xp)
     crouch_hold = crouch
-    crouch_to_takeoff = _lerp(crouch, takeoff, (t - 0.30) / 0.25, xp)
-    takeoff_to_flight = _lerp(takeoff, flight, (t - 0.55) / 0.50, xp)
-    flight_to_crouch = _lerp(flight, crouch, (t - LANDING_START) / 0.30, xp)
-    crouch_to_home = _lerp(crouch, home_pose, (t - RECOVERY_START) / 0.95, xp)
+    crouch_to_takeoff = _lerp(
+        crouch, takeoff, (t - TAKEOFF_START) / (FLIGHT_START - TAKEOFF_START), xp
+    )
+    takeoff_to_flight = _lerp(
+        takeoff, flight, (t - FLIGHT_START) / (LANDING_START - FLIGHT_START), xp
+    )
+    flight_to_crouch = _lerp(
+        flight, crouch, (t - LANDING_START) / (RECOVERY_START - LANDING_START), xp
+    )
+    crouch_to_home = _lerp(
+        crouch, home_pose, (t - RECOVERY_START) / (JUMP_DURATION - RECOVERY_START), xp
+    )
 
-    pose = xp.where((t[..., None] < 0.15), home_to_crouch, crouch_hold)
-    pose = xp.where((t[..., None] >= 0.30), crouch_to_takeoff, pose)
-    pose = xp.where((t[..., None] >= 0.55), takeoff_to_flight, pose)
+    pose = xp.where((t[..., None] < CROUCH_REACHED), home_to_crouch, crouch_hold)
+    pose = xp.where((t[..., None] >= TAKEOFF_START), crouch_to_takeoff, pose)
+    pose = xp.where((t[..., None] >= FLIGHT_START), takeoff_to_flight, pose)
     pose = xp.where((t[..., None] >= LANDING_START), flight_to_crouch, pose)
     pose = xp.where((t[..., None] >= RECOVERY_START), crouch_to_home, pose)
     pose = xp.where((t[..., None] >= JUMP_DURATION), home_pose, pose)

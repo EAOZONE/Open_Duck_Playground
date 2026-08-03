@@ -5,14 +5,30 @@ import os
 
 from playground.common import randomize
 from playground.common.runner import BaseRunner
-from playground.open_duck_mini_v2 import joystick, jump, standing
+from playground.open_duck_mini_v2 import getup, joystick, jump, standing
+
+
+GETUP_ABLATIONS = ("balanced", "corrective", "combined")
+
+
+def configure_goal_only_getup(config, variant: str, *, training: bool):
+    """Applies a reproducible goal-only reward/reset ablation."""
+    if variant not in GETUP_ABLATIONS:
+        raise ValueError(f"Unknown get-up ablation {variant}")
+    config.use_reference_motion = False
+    config.use_worst_foot_flatness = True
+    config.use_leg_reposition_cost = variant in ("corrective", "combined")
+    config.goal_only_reset_mix = (
+        [0.5, 0.25, 0.25] if training and variant == "combined" else [1.0, 0.0, 0.0]
+    )
+    return config
 
 
 class OpenDuckMiniV2Runner(BaseRunner):
-
     def __init__(self, args):
         super().__init__(args)
         available_envs = {
+            "getup": (getup, getup.GetUp),
             "joystick": (joystick, joystick.Joystick),
             "jump": (jump, jump.Jump),
             "standing": (standing, standing.Standing),
@@ -23,11 +39,40 @@ class OpenDuckMiniV2Runner(BaseRunner):
         self.env_file = available_envs[args.env]
 
         self.env_config = self.env_file[0].default_config()
-        self.env = self.env_file[1](task=args.task)
-        self.eval_env = self.env_file[1](task=args.task)
+        if args.env == "getup":
+            use_reference_motion = not args.goal_only_getup
+            getup_ablation = getattr(args, "getup_ablation", "combined")
+            training_config = getup.default_config()
+            if use_reference_motion:
+                training_config.use_reference_motion = True
+                training_config.reference_state_init_probability = 0.7
+                training_config.goal_only_reset_mix = [1.0, 0.0, 0.0]
+            else:
+                configure_goal_only_getup(
+                    training_config, getup_ablation, training=True
+                )
+                training_config.reference_state_init_probability = 0.0
+            self.env = getup.GetUp(task=args.task, config=training_config)
+            # Evaluation is deliberately the harder, requested condition:
+            # every episode starts face-down at phase zero.
+            eval_config = getup.default_config()
+            if use_reference_motion:
+                eval_config.use_reference_motion = True
+                eval_config.goal_only_reset_mix = [1.0, 0.0, 0.0]
+            else:
+                configure_goal_only_getup(eval_config, getup_ablation, training=False)
+            self.eval_env = getup.GetUp(task=args.task, config=eval_config)
+            mode = "reference-guided" if use_reference_motion else "goal-only"
+            suffix = "" if use_reference_motion else f" ({getup_ablation})"
+            print(f"Get-up training mode: {mode}{suffix}")
+        else:
+            self.env = self.env_file[1](task=args.task)
+            self.eval_env = self.env_file[1](task=args.task)
         # Learn the delicate landing correction in nominal dynamics first.
         # Walking keeps its existing randomized training path unchanged.
-        self.randomizer = None if args.env == "jump" else randomize.domain_randomize
+        self.randomizer = (
+            None if args.env in ("jump", "getup") else randomize.domain_randomize
+        )
         self.action_size = self.env.action_size
         self.obs_size = int(
             self.env.observation_size["state"][0]
@@ -81,6 +126,23 @@ def main() -> None:
         "--high-clearance",
         action="store_true",
         help="Train a higher-foot-lift walking gait with commands up to 0.20 m/s.",
+    )
+    parser.add_argument(
+        "--goal-only-getup",
+        action="store_true",
+        help=(
+            "Train get-up directly from face-down to standing without a "
+            "reference animation, phase signal, or moving pose target."
+        ),
+    )
+    parser.add_argument(
+        "--getup-ablation",
+        choices=GETUP_ABLATIONS,
+        default="combined",
+        help=(
+            "Goal-only get-up experiment: worst-foot reward only, add the "
+            "corrective leg cost, or add both the cost and reset curriculum."
+        ),
     )
     # parser.add_argument(
     #     "--debug", action="store_true", help="Run in debug mode with minimal parameters"

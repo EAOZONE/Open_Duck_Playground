@@ -1,4 +1,4 @@
-"""Evaluate scripted or ONNX jump rollouts in the MuJoCo model."""
+"""Evaluate scripted or ONNX excited-hop rollouts in the MuJoCo model."""
 
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ from playground.open_duck_mini_v2.jump_infer import JumpInfer
 
 def evaluate_once(infer: JumpInfer, duration_s: float = 3.0) -> dict[str, float | bool]:
     infer.motion.reset()
-    infer.data.qpos[:] = infer.model.keyframe("home").qpos
-    infer.data.qvel[:] = 0.0
-    infer.data.ctrl[:] = infer.default_actuator
+    mujoco.mj_resetDataKeyframe(
+        infer.model, infer.data, infer.model.keyframe("home").id
+    )
     mujoco.mj_forward(infer.model, infer.data)
     infer.prev_motor_targets = infer.default_actuator.copy()
     infer.motor_targets = infer.default_actuator.copy()

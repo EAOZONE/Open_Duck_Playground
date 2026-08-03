@@ -38,11 +38,29 @@ Infer mujoco
 uv run playground/open_duck_mini_v2/mujoco_infer.py -o <path_to_.onnx>
 ```
 
-## Jump policy
+Add a deliberately excited little walk on top of the learned gait with:
 
-The jump environment trains a one-shot vertical hop with a 104-element
-observation and 14 actuator outputs. The scripted controller is useful for
-checking the motion without a trained checkpoint:
+```bash
+uv run playground/open_duck_mini_v2/mujoco_infer.py \
+  -o <path_to_.onnx> \
+  --fixed-command 0.20 0 0 \
+  --expressive-walk
+```
+
+This adds a two-beat head bounce, a small spring in both knees, and a quick
+head roll/yaw that makes the rigid antennae appear to wiggle. The flourish
+automatically fades out when the movement command returns to zero. Tune it
+with `--head-bobble-amplitude`, `--antenna-wiggle-amplitude`, and
+`--step-bounce-amplitude`. Press `j` or Space in the MuJoCo viewer to stop,
+settle, perform the excited hop, and return to walking. In Xbox mode, press B
+to request the same sequence; A remains the stop/dead-man control.
+
+## Excited-hop policy
+
+The jump environment trains a short, one-shot excited hop with a 104-element
+observation and 14 actuator outputs. Its reference includes a small head nod,
+a brief airborne phase, and an absorbed landing. The scripted controller is
+useful for checking the exact reference without a trained checkpoint:
 
 ```bash
 uv run playground/open_duck_mini_v2/jump_infer.py --controller scripted
@@ -63,6 +81,80 @@ Run a trained jump ONNX policy with:
 ```bash
 uv run playground/open_duck_mini_v2/jump_infer.py \
   --controller onnx --onnx_model_path checkpoints/jump/<checkpoint>.onnx
+```
+
+## Face-down get-up policy
+
+The get-up evaluation resets the robot face-down, follows a four-second reference
+that folds the legs, plants both feet, rises through a crouch, and then holds
+the normal standing pose.  The torso and head use inset collision proxies so
+fall recovery has real floor contacts; these proxies remain clear of the floor
+during normal walking and jumping.
+
+During training, 70% of environments use reference-state initialization at a
+random point in the animation so PPO learns the crouch and stand before
+stitching the full recovery together.  The evaluation environment always uses
+the requested phase-zero face-down reset.
+
+Preview the kinematic reference animation (press `g` or Space to replay it):
+
+```bash
+uv run playground/open_duck_mini_v2/getup_infer.py --controller reference
+```
+
+Train the residual PPO policy from face-down resets:
+
+```bash
+uv run playground/open_duck_mini_v2/runner.py \
+  --env getup --task flat_terrain \
+  --output_dir checkpoints/getup \
+  --num_timesteps 150000000
+```
+
+Train the goal-only policy with the balanced-foot reward, corrective leg cost,
+and late-stage reset curriculum:
+
+```bash
+uv run playground/open_duck_mini_v2/runner.py \
+  --env getup --task flat_terrain --goal-only-getup \
+  --getup-ablation combined \
+  --output_dir checkpoints/getup_goal_only \
+  --num_timesteps 150000000
+```
+
+The `balanced` and `corrective` ablations respectively disable the corrective
+cost, or keep the cost while using face-down resets only.  Compare exported
+policies with the strict two-second standing evaluator:
+
+```bash
+uv run python scripts/evaluate_getup.py \
+  --onnx-model-path checkpoints/getup_goal_only/<checkpoint>.onnx \
+  --episodes 64
+```
+
+For GPU training, build the locked Docker environment and keep checkpoints in
+a host-mounted directory:
+
+```bash
+docker build \
+  --build-arg USER_ID="$(id -u)" \
+  --build-arg GROUP_ID="$(id -g)" \
+  -t open-duck-getup:latest .
+
+GPU_ID=1 \
+OUTPUT_DIR="$PWD/checkpoints/getup" \
+scripts/docker_train_getup.sh
+```
+
+Pass normal runner options after the script name.  For example, a checkpoint
+already below `OUTPUT_DIR` can be resumed with
+`--restore_checkpoint_path /runs/<checkpoint-directory>`.
+
+Run an exported get-up policy in MuJoCo:
+
+```bash
+uv run playground/open_duck_mini_v2/getup_infer.py \
+  --controller onnx --onnx_model_path checkpoints/getup/<checkpoint>.onnx
 ```
 
 # Documentation

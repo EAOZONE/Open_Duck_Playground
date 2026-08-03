@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+.tmp
+.pytest_cache
+**/__pycache__
+**/*.py[cod]
+checkpoints
+dist
+build
+*.egg-info
+train.log
+tensorboard.log

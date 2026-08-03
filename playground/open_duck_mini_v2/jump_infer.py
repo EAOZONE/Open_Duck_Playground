@@ -1,4 +1,4 @@
-"""Interactive MuJoCo inference for scripted and learned Open Duck jumps."""
+"""Interactive MuJoCo inference for scripted and learned Open Duck hops."""
 
 from __future__ import annotations
 
@@ -103,7 +103,6 @@ class JumpInfer:
             self.prev_motor_targets - self.max_motor_velocity * self.sim_dt * self.decimation,
             self.prev_motor_targets + self.max_motor_velocity * self.sim_dt * self.decimation,
         )
-        self.motor_targets[5:9] = self.default_actuator[5:9]
         self.prev_motor_targets = self.motor_targets.copy()
         self.data.ctrl[:] = self.motor_targets
 

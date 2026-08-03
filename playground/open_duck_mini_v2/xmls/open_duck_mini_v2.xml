@@ -62,6 +62,15 @@
       <body name="trunk_assembly" pos="0 0 0.0" quat="1 0 0 0" childclass="open_duck_mini_v2">
         <inertial pos="-0.0483259 -9.97823e-05 0.0384971" mass="0.698526"
           fullinertia="0.00167701 0.00344479 0.00292635 -1.31662e-05 -3.24953e-05 -2.15581e-06"/>
+        <!--
+          The generated model originally collided only at the soles.  A
+          compact torso proxy is needed for fall recovery: without it the
+          body falls through the floor before a get-up controller can act.
+          It is deliberately inset from the visual shell so ordinary gait
+          contacts are unchanged.
+        -->
+        <geom name="trunk_collision" type="box" class="collision"
+          pos="-0.045 0 0.040" size="0.075 0.047 0.055" friction="0.7"/>
         <!-- Part body_front -->
         <geom type="mesh" class="visual" pos="-0.019 0 0.0648909" quat="1 0 0 0" mesh="body_front"
           material="body_front_material"/>
@@ -150,6 +159,8 @@
               <joint name="left_hip_pitch" type="hinge" range="-1.2217304763960306 0.5235987755982988" class="sts3215"/>
               <inertial pos="0.00253369 -0.0390636 0.0102776" mass="0.12407"
                 fullinertia="0.000211406 7.83759e-05 0.000225619 -2.68706e-05 3.81906e-06 2.08009e-05"/>
+              <geom name="left_thigh_collision" type="box" class="collision"
+                pos="0.014 -0.029 0.014" size="0.034 0.058 0.020" friction="0.7"/>
               <!-- Part left_cache -->
               <geom type="mesh" class="visual" pos="0.01606 0.065 0.10915"
                 quat="0.707107 -0.707107 3.33067e-16 5.76761e-16" mesh="left_cache" material="left_cache_material"/>
@@ -174,6 +185,8 @@
                 <joint name="left_knee" type="hinge" range="-1.5707963267948966 1.5707963267948966" class="sts3215"/>
                 <inertial pos="5.01859e-06 -0.0577465 0.0181136" mass="0.07259"
                   fullinertia="4.99575e-05 1.87273e-05 4.23932e-05 1.03817e-08 2.25175e-09 8.81049e-08"/>
+                <geom name="left_shin_collision" type="box" class="collision"
+                  pos="0 -0.025 0.018" size="0.012 0.030 0.018" friction="0.7"/>
                 <!-- Part leg_spacer_2 -->
                 <geom type="mesh" class="visual" pos="0.01606 0.14365 0.10925"
                   quat="0.707107 -0.707107 3.33067e-16 5.72905e-16" mesh="leg_spacer" material="leg_spacer_material"/>
@@ -266,6 +279,9 @@
                 <joint name="head_roll" type="hinge" range="-0.523598775598218 0.5235987755983796" class="sts3215"/>
                 <inertial pos="0.00815416 -0.00390754 0.0227726" mass="0.406607"
                   fullinertia="0.00244627 0.0016864 0.00108002 -2.02404e-06 9.2382e-05 -1.84944e-05"/>
+                <!-- Inset head proxy used as the forward support while rising. -->
+                <geom name="head_collision" type="box" class="collision"
+                  pos="0.045 0 0.040" size="0.055 0.078 0.073" friction="0.7"/>
                 <!-- Part right_antenna_holder -->
                 <geom type="mesh" class="visual" pos="-0.12906 -2.4549e-16 0.06095"
                   quat="0.707107 5.22659e-16 0.707107 3.88578e-15" mesh="right_antenna_holder"
@@ -354,6 +370,8 @@
               <joint name="right_hip_pitch" type="hinge" range="-0.5235987755982988 1.2217304763960306" class="sts3215"/>
               <inertial pos="0.00253369 0.0390636 0.010809" mass="0.12407"
                 fullinertia="0.000212363 7.93324e-05 0.000225619 2.68706e-05 3.9656e-06 -2.17407e-05"/>
+              <geom name="right_thigh_collision" type="box" class="collision"
+                pos="0.014 0.029 0.014" size="0.034 0.058 0.020" friction="0.7"/>
               <!-- Part right_cache -->
               <geom type="mesh" class="visual" pos="0.01606 -0.065 0.1092"
                 quat="0.707107 0.707107 -3.33067e-16 -3.92523e-16" mesh="right_cache" material="right_cache_material"/>
@@ -378,6 +396,8 @@
                 <joint name="right_knee" type="hinge" range="-1.5707963267948966 1.5707963267948966" class="sts3215"/>
                 <inertial pos="5.01859e-06 -0.0577465 0.0181136" mass="0.07259"
                   fullinertia="4.99575e-05 1.87273e-05 4.23932e-05 1.03817e-08 2.25175e-09 8.81049e-08"/>
+                <geom name="right_shin_collision" type="box" class="collision"
+                  pos="0 -0.025 0.018" size="0.012 0.030 0.018" friction="0.7"/>
                 <!-- Part leg_spacer_4 -->
                 <geom type="mesh" class="visual" pos="0.01606 0.14365 0.10925"
                   quat="0.707107 -0.707107 -3.33067e-16 3.92523e-16" mesh="leg_spacer" material="leg_spacer_material"/>

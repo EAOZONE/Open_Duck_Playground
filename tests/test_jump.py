@@ -35,18 +35,21 @@ class JumpMotionTest(unittest.TestCase):
             self.assertTrue(np.isfinite(features).all())
         self.assertEqual(phase_features(JUMP_DURATION)[0], 0.0)
 
-    def test_model_limits_and_head_hold(self) -> None:
+    def test_model_limits_and_expressive_head_motion(self) -> None:
         model = mujoco.MjModel.from_xml_path(
             "playground/open_duck_mini_v2/xmls/scene_flat_terrain.xml"
         )
         home = model.keyframe("home").ctrl.copy()
         lower = model.actuator_ctrlrange[:, 0]
         upper = model.actuator_ctrlrange[:, 1]
+        head_motion = []
         for time_s in np.linspace(0.0, JUMP_DURATION, 41):
             pose = clip_pose(trajectory_pose(time_s, home), lower, upper)
             np.testing.assert_array_less(lower - 1e-6, pose)
             np.testing.assert_array_less(pose, upper + 1e-6)
-            np.testing.assert_allclose(pose[5:9], home[5:9])
+            head_motion.append(np.max(np.abs(pose[5:9] - home[5:9])))
+        self.assertGreater(max(head_motion), 0.03)
+        np.testing.assert_allclose(trajectory_pose(JUMP_DURATION, home), home)
 
 
 if __name__ == "__main__":
