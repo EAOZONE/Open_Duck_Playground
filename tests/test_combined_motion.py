@@ -20,6 +20,17 @@ class CombinedMotionTest(unittest.TestCase):
         infer.commands = [0.2, 0.1, 0.3, 0.0, 0.0, 0.0, 0.0]
         infer._latched_forward_command = 0.2
         infer._hop_button_was_pressed = False
+        infer.use_xbox_controller = False
+        infer.head_control_mode = False
+        infer.playful_policy = True
+        infer.playful_mode = True
+        infer.keyboard_gait_mode = "standing"
+        infer.walk_policy = object()
+        infer.stand_policy = object()
+        infer.fixed_command = None
+        infer.gait_cycle = 0
+        infer.imitation_i = 12
+        infer.imitation_phase = np.array([0.5, -0.5])
         infer.default_actuator = np.linspace(-0.2, 0.2, 14, dtype=np.float32)
         infer.prev_motor_targets = np.ones(14, dtype=np.float32)
         infer.last_action = np.ones(14, dtype=np.float32)
@@ -40,6 +51,39 @@ class CombinedMotionTest(unittest.TestCase):
         infer.use_xbox_controller = True
         infer.key_callback(74)
         self.assertTrue(infer.hop_requested)
+
+    def test_keyboard_selects_normal_playful_and_standing_modes(self) -> None:
+        infer = self._infer()
+
+        infer.key_callback(infer.KEY_NORMAL_WALK)
+        self.assertEqual(infer.keyboard_gait_mode, "normal")
+        self.assertIs(infer._active_locomotion_policy(), infer.walk_policy)
+        self.assertFalse(infer.playful_mode)
+        self.assertEqual(infer.fixed_command, (0.2, 0.0, 0.0))
+        self.assertEqual(infer.commands[6], 0.0)
+
+        infer.gait_cycle = 2
+        infer.key_callback(infer.KEY_PLAYFUL_WALK)
+        self.assertEqual(infer.keyboard_gait_mode, "playful")
+        self.assertTrue(infer.playful_mode)
+        self.assertEqual(infer.fixed_command, (0.2, 0.0, 0.0))
+        self.assertEqual(infer.commands[6], 0.5)
+
+        infer.key_callback(infer.KEY_STAND)
+        self.assertEqual(infer.keyboard_gait_mode, "standing")
+        self.assertIs(infer._active_locomotion_policy(), infer.stand_policy)
+        self.assertFalse(infer.playful_mode)
+        self.assertEqual(infer.fixed_command, (0.0, 0.0, 0.0))
+        np.testing.assert_allclose(infer.commands, 0.0)
+        np.testing.assert_allclose(infer.imitation_phase, 0.0)
+
+    def test_stand_key_is_rejected_without_a_standing_policy(self) -> None:
+        infer = self._infer()
+        infer.keyboard_gait_mode = "normal"
+        infer.stand_policy = None
+
+        self.assertFalse(infer._set_keyboard_gait_mode("standing"))
+        self.assertEqual(infer.keyboard_gait_mode, "normal")
 
     def test_xbox_hop_uses_a_rising_button_edge(self) -> None:
         infer = self._infer()

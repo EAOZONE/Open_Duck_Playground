@@ -9,6 +9,8 @@ try:
     import jax
 
     from playground.open_duck_mini_v2.getup import (
+        BACK_DOWN_QUAT,
+        BACK_DOWN_ROOT_HEIGHT,
         LEFT_FOOT_STUCK_QPOS,
         RIGHT_FOOT_STUCK_QPOS,
         STANDING_FOOT_NORMAL_MIN,
@@ -150,6 +152,23 @@ class GetUpMotionTest(unittest.TestCase):
         forward = data.sensordata[address : address + dimension]
         self.assertLess(float(forward[2]), -0.99)
 
+    @unittest.skipUnless(HAS_JAX, "JAX is provided by the training container")
+    def test_back_quaternion_is_supine_and_clear_of_floor(self) -> None:
+        model = mujoco.MjModel.from_xml_path(
+            "playground/open_duck_mini_v2/xmls/scene_flat_terrain.xml"
+        )
+        data = mujoco.MjData(model)
+        data.qpos[:] = model.keyframe("home").qpos
+        data.qpos[2] = BACK_DOWN_ROOT_HEIGHT
+        data.qpos[3:7] = BACK_DOWN_QUAT
+        mujoco.mj_forward(model, data)
+        sensor = model.sensor("forwardvector")
+        address = int(model.sensor_adr[sensor.id])
+        dimension = int(model.sensor_dim[sensor.id])
+        forward = data.sensordata[address : address + dimension]
+        self.assertGreater(float(forward[2]), 0.99)
+        self.assertEqual(data.ncon, 0)
+
     def test_standing_pose_has_flat_foot_frames(self) -> None:
         model = mujoco.MjModel.from_xml_path(
             "playground/open_duck_mini_v2/xmls/scene_flat_terrain.xml"
@@ -252,6 +271,25 @@ class GetUpMotionTest(unittest.TestCase):
                 np.asarray(state.info["jump_phase"]), np.zeros(3)
             )
             self.assertEqual(int(state.info["reset_mode"]), expected_mode)
+            self.assertTrue(np.isfinite(np.asarray(state.data.qpos)).all())
+
+    @unittest.skipUnless(HAS_JAX, "JAX is provided by the training container")
+    def test_back_goal_only_reset_preserves_actor_contract(self) -> None:
+        for expected_mode in range(4):
+            config = default_config()
+            config.use_reference_motion = False
+            config.fallen_orientation = "back"
+            config.goal_only_reset_mix = [1.0, 0.0, 0.0]
+            config.back_getup_reset_mix = [
+                float(index == expected_mode) for index in range(4)
+            ]
+            env = GetUp(config=config)
+            state = env.reset(jax.random.PRNGKey(expected_mode + 4))
+            self.assertEqual(state.obs["state"].shape, (104,))
+            self.assertEqual(int(state.info["reset_mode"]), expected_mode)
+            np.testing.assert_array_equal(
+                np.asarray(state.info["jump_phase"]), np.zeros(3)
+            )
             self.assertTrue(np.isfinite(np.asarray(state.data.qpos)).all())
 
     @unittest.skipUnless(HAS_JAX, "JAX is provided by the training container")

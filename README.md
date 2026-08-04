@@ -93,6 +93,33 @@ uv run playground/open_duck_mini_v2/mujoco_infer.py \
   --fixed-command 0.20 0 0 --playful-policy
 ```
 
+For an interactive keyboard demo, omit `--fixed-command` and use the viewer
+keys to switch persistent modes:
+
+- `W`: normal forward walk with the accent cue disabled;
+- `P`: playful forward walk with alternating high accent steps;
+- `S`: switch to the separately trained stand-in-place policy;
+- `J` or Space: settle, jump, recover, and return to the selected mode.
+
+```bash
+uv run playground/open_duck_mini_v2/mujoco_infer.py \
+  -o playground/open_duck_mini_v2/models/playful_high_step_walk.onnx \
+  --stand-onnx-model-path playground/open_duck_mini_v2/models/stand_in_place.onnx \
+  --playful-policy
+```
+
+The standing actor deliberately uses the same 101-element observation and
+14-action interface as walking, but is trained only on a zero command with
+explicit penalties for planar drift and foot motion. Train it from scratch
+with:
+
+```bash
+uv run playground/open_duck_mini_v2/runner.py \
+  --env standing --task flat_terrain \
+  --output_dir checkpoints/standing \
+  --num_timesteps 100000000 --num_evals 20
+```
+
 ## Excited-hop policy
 
 The jump environment trains a short, one-shot excited hop with a 104-element
@@ -171,6 +198,43 @@ policies with the strict two-second standing evaluator:
 uv run python scripts/evaluate_getup.py \
   --onnx-model-path checkpoints/getup_goal_only/<checkpoint>.onnx \
   --episodes 64
+```
+
+To fine-tune a separate recovery from a supine/back fall, warm-start from a
+goal-only get-up checkpoint and use the two-stage `--back-getup` curriculum.
+This keeps the same 104-observation and 14-action policy interface. The
+foundation phase learns either-side, low-crouch, and near-standing recoveries;
+the full phase then introduces complete back-down starts while continuing to
+rehearse those intermediate stages:
+
+```bash
+uv run playground/open_duck_mini_v2/runner.py \
+  --env getup --task flat_terrain --back-getup \
+  --back-getup-stage foundation \
+  --restore_checkpoint_path checkpoints/<front-getup-checkpoint> \
+  --output_dir checkpoints/back_getup_foundation \
+  --num_timesteps 50000000 --num_evals 10 \
+  --learning-rate 0.0001 --entropy-cost 0.001
+
+uv run playground/open_duck_mini_v2/runner.py \
+  --env getup --task flat_terrain --back-getup \
+  --back-getup-stage full \
+  --restore_checkpoint_path checkpoints/<foundation-checkpoint> \
+  --output_dir checkpoints/back_getup_full \
+  --num_timesteps 100000000 --num_evals 20 \
+  --learning-rate 0.0001 --entropy-cost 0.001
+```
+
+Evaluate and preview the back-start policy with:
+
+```bash
+uv run scripts/evaluate_getup.py \
+  --onnx-model-path checkpoints/back_getup/<checkpoint>.onnx \
+  --reset back --episodes 64
+
+uv run playground/open_duck_mini_v2/getup_infer.py \
+  --controller onnx --onnx_model_path checkpoints/back_getup/<checkpoint>.onnx \
+  --goal-only --from-back
 ```
 
 For GPU training, build the locked Docker environment and keep checkpoints in

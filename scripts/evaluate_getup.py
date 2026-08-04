@@ -9,12 +9,21 @@ import mujoco
 import numpy as np
 
 from playground.open_duck_mini_v2.getup import (
+    BACK_DOWN_QUAT,
+    BACK_DOWN_ROOT_HEIGHT,
     LEFT_FOOT_STUCK_QPOS,
     RIGHT_FOOT_STUCK_QPOS,
+    SIDE_DOWN_QUATS,
+    SIDE_DOWN_ROOT_HEIGHT,
     STANDING_FOOT_NORMAL_MIN,
 )
 from playground.open_duck_mini_v2.getup_infer import GetUpInfer
-from playground.open_duck_mini_v2.getup_motion import GETUP_DURATION
+from playground.open_duck_mini_v2.getup_motion import (
+    CROUCH_REACHED,
+    GETUP_DURATION,
+    root_trajectory,
+    trajectory_pose,
+)
 
 
 def _multiply_axis_angle(
@@ -41,6 +50,24 @@ def reset_episode(
         infer.data.qpos[:] = LEFT_FOOT_STUCK_QPOS
     elif reset == "near-standing":
         infer.data.qpos[:] = infer.model.keyframe("home").qpos
+    elif reset == "back":
+        infer.data.qpos[:] = infer.model.keyframe("home").qpos
+        infer.data.qpos[2] = BACK_DOWN_ROOT_HEIGHT
+        infer.data.qpos[3:7] = BACK_DOWN_QUAT
+    elif reset in ("left-side", "right-side"):
+        infer.data.qpos[:] = infer.model.keyframe("home").qpos
+        infer.data.qpos[2] = SIDE_DOWN_ROOT_HEIGHT
+        side_index = 1 if reset == "right-side" else 0
+        infer.data.qpos[3:7] = SIDE_DOWN_QUATS[side_index]
+    elif reset == "crouch":
+        infer.data.qpos[:] = infer.model.keyframe("home").qpos
+        root_pos, root_quat = root_trajectory(CROUCH_REACHED)
+        infer.data.qpos[:3] = root_pos
+        infer.data.qpos[3:7] = root_quat
+        infer.base.set_actuator_joints_qpos(
+            trajectory_pose(CROUCH_REACHED, infer.default_actuator),
+            infer.data.qpos,
+        )
 
     if randomized:
         infer.data.qpos[:2] += rng.uniform(-0.015, 0.015, size=2)
@@ -180,7 +207,16 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--reset",
-        choices=("face-down", "right-stuck", "left-stuck", "near-standing"),
+        choices=(
+            "face-down",
+            "back",
+            "left-side",
+            "right-side",
+            "crouch",
+            "right-stuck",
+            "left-stuck",
+            "near-standing",
+        ),
         default="face-down",
     )
     parser.add_argument("--exact", action="store_true")

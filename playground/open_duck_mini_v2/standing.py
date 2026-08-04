@@ -35,7 +35,6 @@ from playground.common.rewards import (
     cost_action_rate,
     cost_stand_still,
     reward_alive,
-    cost_head_pos,
 )
 
 # if set to false, won't require the reference data to be present and won't compute the reference motions polynoms for nothing
@@ -51,6 +50,7 @@ def default_config() -> config_dict.ConfigDict:
         action_repeat=1,
         action_scale=0.25,
         dof_vel_scale=0.05,
+        max_motor_velocity=5.24,
         history_len=0,
         soft_joint_pos_limit_factor=0.95,
         noise_config=config_dict.create(
@@ -76,11 +76,11 @@ def default_config() -> config_dict.ConfigDict:
                 # tracking_ang_vel=4.0,
                 orientation=-0.5,
                 torques=-1.0e-3,
-                action_rate=-0.375,  # was -1.5
-                stand_still=-0.3,  # was -1.0 TODO try to relax this a bit ?
+                action_rate=-0.5,
+                stand_still=-0.75,
+                planar_velocity=-5.0,
+                feet_motion=-1.0,
                 alive=20.0,
-                # imitation=1.0,
-                head_pos=-2.0,
             ),
             tracking_sigma=0.01,  # was working at 0.01
         ),
@@ -232,7 +232,7 @@ class Standing(open_duck_mini_v2_base.OpenDuckMiniV2Env):
 
         # multiply actual joints with noise (excluding floating base and backlash)
         qpos_j = self.get_actuator_joints_qpos(qpos) * jax.random.uniform(
-            key, (self._actuators,), minval=0.5, maxval=1.5
+            key, (self._actuators,), minval=0.9, maxval=1.1
         )
         qpos = self.set_actuator_joints_qpos(qpos_j, qpos)
         # print(f'DEBUG2 joint qpos: {qpos}')
@@ -244,7 +244,7 @@ class Standing(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         # )
 
         qvel = self.set_floating_base_qvel(
-            jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5), qvel
+            jax.random.uniform(key, (6,), minval=-0.05, maxval=0.05), qvel
         )
         # print(f'DEBUG3 base qvel: {qvel}')
         ctrl = self.get_actuator_joints_qpos(qpos)
@@ -276,7 +276,7 @@ class Standing(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             "last_act": jp.zeros(self.mjx_model.nu),
             "last_last_act": jp.zeros(self.mjx_model.nu),
             "last_last_last_act": jp.zeros(self.mjx_model.nu),
-            "motor_targets": jp.zeros(self.mjx_model.nu),
+            "motor_targets": self._default_actuator,
             "feet_air_time": jp.zeros(2),
             "last_contact": jp.zeros(2, dtype=bool),
             "swing_peak": jp.zeros(2),
@@ -291,6 +291,7 @@ class Standing(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             "imu_history": jp.zeros(self._config.noise_config.imu_max_delay * 3),
             # imitation related
             "imitation_i": 0,
+            "imitation_phase": jp.zeros(2),
             "current_reference_motion": current_reference_motion,
         }
 
@@ -377,6 +378,13 @@ class Standing(open_duck_mini_v2_base.OpenDuckMiniV2Env):
 
         motor_targets = (
             self._default_actuator + action_w_delay * self._config.action_scale
+        )
+
+        prev_motor_targets = state.info["motor_targets"]
+        motor_targets = jp.clip(
+            motor_targets,
+            prev_motor_targets - self._config.max_motor_velocity * self.dt,
+            prev_motor_targets + self._config.max_motor_velocity * self.dt,
         )
         data = mjx_env.step(self.mjx_model, state.data, motor_targets, self.n_substeps)
         state.info["motor_targets"] = motor_targets
@@ -536,8 +544,9 @@ class Standing(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 info["last_act"],  # 10
                 info["last_last_act"],  # 10
                 info["last_last_last_act"],  # 10
+                info["motor_targets"],  # 14
                 contact,  # 2
-                info["current_reference_motion"],
+                info["imitation_phase"],  # 2
             ]
         )
 
@@ -562,6 +571,8 @@ class Standing(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 feet_vel,  # 4*3
                 info["feet_air_time"],  # 2
                 info["current_reference_motion"],
+                info["imitation_i"],
+                info["imitation_phase"],
             ]
         )
 
@@ -582,6 +593,8 @@ class Standing(open_duck_mini_v2_base.OpenDuckMiniV2Env):
     ) -> dict[str, jax.Array]:
         del metrics  # Unused.
 
+        feet_vel = data.sensordata[self._foot_linvel_sensor_adr]
+
         ret = {
             "orientation": cost_orientation(self.get_gravity(data)),
             "torques": cost_torques(data.actuator_force),
@@ -593,69 +606,17 @@ class Standing(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 self.get_actuator_joints_qpos(data.qpos),
                 self.get_actuator_joints_qvel(data.qvel),
                 self._default_actuator,
-                True
+                ignore_head=False,
             ),
-            "head_pos": cost_head_pos(
-                self.get_actuator_joints_qpos(data.qpos),
-                self.get_actuator_joints_qvel(data.qvel),
-                info["command"],
-            ),
+            "planar_velocity": jp.sum(jp.square(self.get_local_linvel(data)[:2])),
+            "feet_motion": jp.sum(jp.square(feet_vel[..., :2])),
         }
 
         return ret
 
     def sample_command(self, rng: jax.Array) -> jax.Array:
-        rng1, rng2, rng3, rng4, rng5, rng6, rng7, rng8 = jax.random.split(rng, 8)
-
-        # lin_vel_x = jax.random.uniform(
-        #     rng1, minval=self._config.lin_vel_x[0], maxval=self._config.lin_vel_x[1]
-        # )
-        # lin_vel_y = jax.random.uniform(
-        #     rng2, minval=self._config.lin_vel_y[0], maxval=self._config.lin_vel_y[1]
-        # )
-        # ang_vel_yaw = jax.random.uniform(
-        #     rng3,
-        #     minval=self._config.ang_vel_yaw[0],
-        #     maxval=self._config.ang_vel_yaw[1],
-        # )
-
-        neck_pitch = jax.random.uniform(
-            rng5,
-            minval=self._config.neck_pitch_range[0] * self._config.head_range_factor,
-            maxval=self._config.neck_pitch_range[1] * self._config.head_range_factor,
-        )
-
-        head_pitch = jax.random.uniform(
-            rng6,
-            minval=self._config.head_pitch_range[0] * self._config.head_range_factor,
-            maxval=self._config.head_pitch_range[1] * self._config.head_range_factor,
-        )
-
-        head_yaw = jax.random.uniform(
-            rng7,
-            minval=self._config.head_yaw_range[0] * self._config.head_range_factor,
-            maxval=self._config.head_yaw_range[1] * self._config.head_range_factor,
-        )
-
-        head_roll = jax.random.uniform(
-            rng8,
-            minval=self._config.head_roll_range[0] * self._config.head_range_factor,
-            maxval=self._config.head_roll_range[1] * self._config.head_range_factor,
-        )
-
-        # With 10% chance, set everything to zero.
-        return jp.where(
-            jax.random.bernoulli(rng4, p=0.1),
-            jp.zeros(7),
-            jp.hstack(
-                [
-                    0.0,
-                    0.0,
-                    0.0,
-                    neck_pitch,
-                    head_pitch,
-                    head_yaw,
-                    head_roll,
-                ]
-            ),
-        )
+        del rng
+        # A dedicated standing controller has one unambiguous task: keep the
+        # complete home pose stationary.  Its 7-command input remains present
+        # solely to keep the deployed observation layout identical to walking.
+        return jp.zeros(7)

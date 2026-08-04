@@ -16,6 +16,10 @@ USE_MOTOR_SPEED_LIMITS = True
 
 
 class MjInfer(MJInferBase):
+    KEY_JUMP = 74
+    KEY_PLAYFUL_WALK = 80
+    KEY_STAND = 83
+    KEY_NORMAL_WALK = 87
     COMMANDS_RANGE_X = [-0.20, 0.20]
     COMMANDS_RANGE_Y = [-0.2, 0.2]
     COMMANDS_RANGE_THETA = [-1.0, 1.0]
@@ -37,6 +41,7 @@ class MjInfer(MJInferBase):
         reference_data: str,
         onnx_model_path: str,
         standing: bool,
+        stand_onnx_model_path: str | None = None,
         policy_only: bool = False,
         xbox_controller: bool = False,
         fixed_command: tuple[float, float, float] | None = None,
@@ -58,6 +63,8 @@ class MjInfer(MJInferBase):
         self.latched_forward_speed = float(latched_forward_speed)
         self.expressive_walk = expressive_walk
         self.playful_policy = playful_policy
+        self.playful_mode = bool(playful_policy)
+        self.keyboard_gait_mode = "standing" if standing else "normal"
         self.head_bobble_amplitude = float(head_bobble_amplitude)
         self.antenna_wiggle_amplitude = float(antenna_wiggle_amplitude)
         self.step_bounce_amplitude = float(step_bounce_amplitude)
@@ -86,7 +93,14 @@ class MjInfer(MJInferBase):
         if not self.standing and not self.policy_only:
             self.PRM = PolyReferenceMotion(reference_data)
 
-        self.policy = OnnxInfer(onnx_model_path, awd=True)
+        self.walk_policy = OnnxInfer(onnx_model_path, awd=True)
+        self.stand_policy = (
+            OnnxInfer(stand_onnx_model_path, awd=True)
+            if stand_onnx_model_path is not None
+            else (self.walk_policy if standing else None)
+        )
+        # Retain the old attribute for small external scripts that inspect it.
+        self.policy = self.walk_policy
 
         self.COMMANDS_RANGE_X = [-0.20, 0.20]
         self.COMMANDS_RANGE_Y = [-0.2, 0.2]
@@ -114,6 +128,12 @@ class MjInfer(MJInferBase):
         print(f"joint names: {self.joint_names}")
         print(f"actuator names: {self.actuator_names}")
         print(f"backlash joint names: {self.backlash_joint_names}")
+        if not self.use_xbox_controller:
+            stand_status = "ready" if self.stand_policy is not None else "not loaded"
+            print(
+                "Keyboard modes: W normal walk, P playful walk, "
+                f"S stand ({stand_status}), J jump"
+            )
         # print(f"actual joints idx: {self.get_actual_joints_idx()}")
 
     def _apply_expressive_style(self) -> None:
@@ -173,10 +193,48 @@ class MjInfer(MJInferBase):
             return
         cue = (
             playful_walk.skip_cue_for_cycle(self.gait_cycle, np)
-            if moving
+            if moving and self.playful_mode
             else 0.0
         )
         self.commands[playful_walk.SKIP_COMMAND_INDEX] = float(cue)
+
+    def _set_keyboard_gait_mode(self, mode: str) -> bool:
+        """Select a persistent forward, playful-forward, or standing mode."""
+        if mode not in ("normal", "playful", "standing"):
+            raise ValueError(f"Unknown keyboard gait mode: {mode}")
+        if mode == "standing" and self.stand_policy is None:
+            print(
+                "Standing policy is not loaded; pass --stand-onnx-model-path "
+                "to enable S"
+            )
+            return False
+
+        moving = mode != "standing"
+        speed = self.DEFAULT_LATCHED_FORWARD_SPEED if moving else 0.0
+        changed = mode != self.keyboard_gait_mode
+        self.keyboard_gait_mode = mode
+        self.playful_mode = mode == "playful"
+        self.fixed_command = (speed, 0.0, 0.0)
+        self._latched_forward_command = speed
+        self.commands[:3] = list(self.fixed_command)
+        self.commands[3:] = [0.0, 0.0, 0.0, 0.0]
+        if changed:
+            self._reset_policy_history()
+            self.imitation_i = 0
+            self.imitation_phase = np.zeros(2)
+        self._update_playful_policy_cue(moving)
+
+        suffix = "" if mode != "playful" or self.playful_policy else " (cue disabled)"
+        print(f"Keyboard mode: {mode}{suffix}")
+        return True
+
+    def _active_locomotion_policy(self):
+        """Return the learned controller selected by the current keyboard mode."""
+        if self.keyboard_gait_mode == "standing":
+            if self.stand_policy is None:
+                raise RuntimeError("Standing mode selected without a standing policy")
+            return self.stand_policy
+        return self.walk_policy
 
     def request_hop(self) -> bool:
         """Queue one hop when the walking controller is available."""
@@ -417,15 +475,22 @@ class MjInfer(MJInferBase):
 
     def key_callback(self, keycode):
         print(f"key: {keycode}")
-        if keycode in (74, 32):  # J or Space
+        if keycode in (self.KEY_JUMP, 32):  # J or Space
             self.request_hop()
+            return
+        if keycode == self.KEY_NORMAL_WALK:
+            self._set_keyboard_gait_mode("normal")
+            return
+        if keycode == self.KEY_PLAYFUL_WALK:
+            self._set_keyboard_gait_mode("playful")
+            return
+        if keycode == self.KEY_STAND:
+            self._set_keyboard_gait_mode("standing")
             return
         # Do not let a viewer key event clear or replace a live controller
         # command. Controller input is sampled every policy tick instead.
         if self.use_xbox_controller:
-            if keycode == 80:  # p
-                self.phase_frequency_factor += 0.1
-            elif keycode == 59:  # m
+            if keycode == 59:  # m
                 self.phase_frequency_factor -= 0.1
             return
         if keycode == 72:  # h
@@ -446,8 +511,6 @@ class MjInfer(MJInferBase):
                 ang_vel = self.COMMANDS_RANGE_THETA[1]
             if keycode == 69:  # e
                 ang_vel = self.COMMANDS_RANGE_THETA[0]
-            if keycode == 80:  # p
-                self.phase_frequency_factor += 0.1
             if keycode == 59:  # m
                 self.phase_frequency_factor -= 0.1
         else:
@@ -511,6 +574,7 @@ class MjInfer(MJInferBase):
                             self.motion_mode in ("walking", "settling")
                             and not self.standing
                             and not self.policy_only
+                            and self.keyboard_gait_mode != "standing"
                         ):
                             previous_i = self.imitation_i
                             self.imitation_i += 1.0 * self.phase_frequency_factor
@@ -548,7 +612,7 @@ class MjInfer(MJInferBase):
                                 self.commands,
                             )
                             self.saved_obs.append(obs)
-                            action = self.policy.infer(obs)
+                            action = self._active_locomotion_policy().infer(obs)
 
                             # self.action_filter.push(action)
                             # action = self.action_filter.get_filtered_action()
@@ -625,6 +689,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--standing", action="store_true", default=False)
     parser.add_argument(
+        "--stand-onnx-model-path",
+        type=str,
+        help=(
+            "Load a separate 101-observation standing policy and select it "
+            "when S is pressed."
+        ),
+    )
+    parser.add_argument(
         "--no-imitation-reward",
         action="store_true",
         help="Keep gait-phase inputs at zero for a policy trained without imitation.",
@@ -691,6 +763,7 @@ if __name__ == "__main__":
         reference_data=args.reference_data,
         onnx_model_path=args.onnx_model_path,
         standing=args.standing,
+        stand_onnx_model_path=args.stand_onnx_model_path,
         policy_only=args.no_imitation_reward,
         xbox_controller=args.xbox_controller,
         fixed_command=tuple(args.fixed_command) if args.fixed_command else None,

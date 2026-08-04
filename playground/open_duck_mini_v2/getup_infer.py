@@ -10,6 +10,10 @@ import mujoco.viewer
 import numpy as np
 
 from playground.common.onnx_infer import OnnxInfer
+from playground.open_duck_mini_v2.getup import (
+    BACK_DOWN_QUAT,
+    BACK_DOWN_ROOT_HEIGHT,
+)
 from playground.open_duck_mini_v2.getup_motion import GetUpMotionController
 from playground.open_duck_mini_v2.mujoco_infer_base import MJInferBase
 
@@ -21,6 +25,7 @@ class GetUpInfer:
         controller: str = "reference",
         onnx_model_path: str | None = None,
         use_reference_motion: bool = True,
+        fallen_orientation: str = "front",
     ) -> None:
         self.base = MJInferBase(model_path)
         self.model = self.base.model
@@ -36,6 +41,11 @@ class GetUpInfer:
         self.decimation = 10
         self.controller_name = controller
         self.use_reference_motion = use_reference_motion
+        if fallen_orientation not in ("front", "back"):
+            raise ValueError("fallen_orientation must be 'front' or 'back'")
+        if fallen_orientation == "back" and use_reference_motion:
+            raise ValueError("Back get-up requires a goal-only ONNX policy")
+        self.fallen_orientation = fallen_orientation
         self.motion = GetUpMotionController()
         self.start_xy = np.zeros(2, dtype=np.float32)
         self.last_action = np.zeros(self.base.num_dofs, dtype=np.float32)
@@ -72,9 +82,23 @@ class GetUpInfer:
             self.last_action[:] = 0.0
             self.last_last_action[:] = 0.0
             self.last_last_last_action[:] = 0.0
-            # Every replay begins from the exact face-down training reset.
-            self._set_reference_state()
-            print("Face-down get-up armed")
+            if self.fallen_orientation == "back":
+                self.data.qpos[:] = self.model.keyframe("home").qpos
+                base_qpos = self.base.get_floating_base_qpos(self.data.qpos).copy()
+                base_qpos[:2] = self.start_xy
+                base_qpos[2] = BACK_DOWN_ROOT_HEIGHT
+                base_qpos[3:7] = BACK_DOWN_QUAT
+                self.base.set_floating_base_qpos(base_qpos, self.data.qpos)
+                self.data.qvel[:] = 0.0
+                self.data.ctrl[:] = self.default_actuator
+                self.motor_targets = self.default_actuator.copy()
+                self.prev_motor_targets = self.default_actuator.copy()
+                mujoco.mj_forward(self.model, self.data)
+                print("Back-down get-up armed")
+            else:
+                # Every replay begins from the exact face-down training reset.
+                self._set_reference_state()
+                print("Face-down get-up armed")
         return accepted
 
     def get_obs(self) -> np.ndarray:
@@ -180,6 +204,11 @@ def main() -> None:
         help="Use a goal-only policy with no animation target or phase signal.",
     )
     parser.add_argument(
+        "--from-back",
+        action="store_true",
+        help="Reset supine and run a separately trained back-get-up policy.",
+    )
+    parser.add_argument(
         "--model_path",
         default="playground/open_duck_mini_v2/xmls/scene_flat_terrain.xml",
     )
@@ -189,6 +218,7 @@ def main() -> None:
         controller=args.controller,
         onnx_model_path=args.onnx_model_path,
         use_reference_motion=not args.goal_only,
+        fallen_orientation="back" if args.from_back else "front",
     ).run()
 
 

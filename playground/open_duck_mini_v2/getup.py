@@ -1,4 +1,4 @@
-"""MuJoCo PPO task for recovering to standing from a face-down fall."""
+"""MuJoCo PPO task for recovering to standing from a front or back fall."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from mujoco_playground._src.collision import geoms_colliding
 from playground.common.rewards import cost_action_rate, cost_torques
 from . import jump
 from .getup_motion import (
+    CROUCH_REACHED,
     GETUP_DURATION,
     PRONE_ROOT_HEIGHT,
     PLANT_REACHED,
@@ -32,6 +33,19 @@ from .getup_motion import (
 USE_MOTOR_SPEED_LIMITS = True
 STANDING_FOOT_NORMAL_MIN = float(np.cos(np.deg2rad(15.0)))
 STANDING_HOLD_STEPS = 25
+BACK_DOWN_QUAT = np.array([0.7480, 0.0, -0.6637, 0.0], dtype=np.float32)
+BACK_DOWN_QUAT /= np.linalg.norm(BACK_DOWN_QUAT)
+# With the home-pose legs folded above the torso, 0.125 m starts the supine
+# robot just clear of the floor.  It settles naturally to about 0.120 m.
+BACK_DOWN_ROOT_HEIGHT = 0.125
+SIDE_DOWN_QUATS = np.array(
+    [
+        [np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0],
+        [np.sqrt(0.5), -np.sqrt(0.5), 0.0, 0.0],
+    ],
+    dtype=np.float32,
+)
+SIDE_DOWN_ROOT_HEIGHT = 0.120
 
 # A physically settled late-stage failure from the goal-only policy.  The
 # torso is upright and raised, the left sole is flat, and the right sole is
@@ -149,9 +163,12 @@ def default_config() -> config_dict.ConfigDict:
         # Goal-only mode keeps the face-down reset and standing objective but
         # removes the time-indexed animation, phase input, and moving target.
         use_reference_motion=True,
+        fallen_orientation="front",
         # Goal-only training reset mix: [face-down, stuck-foot, near-stand].
         # Evaluation overrides this with [1, 0, 0].
         goal_only_reset_mix=[0.5, 0.25, 0.25],
+        # Back curriculum: [back, either side, low crouch, near-standing].
+        back_getup_reset_mix=[0.55, 0.25, 0.15, 0.05],
         use_worst_foot_flatness=True,
         use_leg_reposition_cost=True,
         # The standalone environment and evaluation always start face-down.
@@ -196,7 +213,7 @@ def default_config() -> config_dict.ConfigDict:
 
 
 class GetUp(jump.Jump):
-    """Learn a reference-guided face-down get-up and stable final stance."""
+    """Learn a get-up from the configured fallen side and hold a stable stance."""
 
     def __init__(
         self,
@@ -225,6 +242,13 @@ class GetUp(jump.Jump):
         )
         if self.mjx_model.nq != RIGHT_FOOT_STUCK_QPOS.shape[0]:
             raise ValueError("Get-up curriculum qpos does not match the loaded model")
+        if self._config.fallen_orientation not in ("front", "back"):
+            raise ValueError("fallen_orientation must be 'front' or 'back'")
+        if (
+            self._config.fallen_orientation == "back"
+            and self._config.use_reference_motion
+        ):
+            raise ValueError("Back get-up currently requires goal-only training")
         reset_mix = np.asarray(self._config.goal_only_reset_mix, dtype=float)
         if (
             reset_mix.shape != (3,)
@@ -233,6 +257,18 @@ class GetUp(jump.Jump):
         ):
             raise ValueError(
                 "goal_only_reset_mix must contain three nonnegative values "
+                "that sum to one"
+            )
+        back_reset_mix = np.asarray(
+            self._config.back_getup_reset_mix, dtype=float
+        )
+        if (
+            back_reset_mix.shape != (4,)
+            or np.any(back_reset_mix < 0.0)
+            or not np.isclose(back_reset_mix.sum(), 1.0)
+        ):
+            raise ValueError(
+                "back_getup_reset_mix must contain four nonnegative values "
                 "that sum to one"
             )
 
@@ -266,20 +302,30 @@ class GetUp(jump.Jump):
         target_root_pos, target_root_quat = root_trajectory(initial_time, dxy, jp)
         base_qpos = self.get_floating_base_qpos(qpos)
         base_qpos = base_qpos.at[:2].set(dxy)
-        base_qpos = base_qpos.at[2].set(target_root_pos[2])
-        quat = target_root_quat
+        if self._config.fallen_orientation == "back":
+            base_qpos = base_qpos.at[2].set(BACK_DOWN_ROOT_HEIGHT)
+            quat = jp.asarray(BACK_DOWN_QUAT)
+        else:
+            base_qpos = base_qpos.at[2].set(target_root_pos[2])
+            quat = target_root_quat
         roll = jax.random.uniform(roll_rng, (), minval=-0.06, maxval=0.06)
         pitch = jax.random.uniform(pitch_rng, (), minval=-0.08, maxval=0.08)
         yaw = jax.random.uniform(yaw_rng, (), minval=-0.12, maxval=0.12)
-        quat = math.quat_mul(
-            math.axis_angle_to_quat(jp.array([0.0, 0.0, 1.0]), yaw), quat
-        )
-        quat = math.quat_mul(
-            math.axis_angle_to_quat(jp.array([0.0, 1.0, 0.0]), pitch), quat
-        )
-        quat = math.quat_mul(
-            math.axis_angle_to_quat(jp.array([1.0, 0.0, 0.0]), roll), quat
-        )
+        def perturb_quaternion(input_quat: jax.Array) -> jax.Array:
+            output_quat = math.quat_mul(
+                math.axis_angle_to_quat(jp.array([0.0, 0.0, 1.0]), yaw),
+                input_quat,
+            )
+            output_quat = math.quat_mul(
+                math.axis_angle_to_quat(jp.array([0.0, 1.0, 0.0]), pitch),
+                output_quat,
+            )
+            return math.quat_mul(
+                math.axis_angle_to_quat(jp.array([1.0, 0.0, 0.0]), roll),
+                output_quat,
+            )
+
+        quat = perturb_quaternion(quat)
         base_qpos = base_qpos.at[3:7].set(quat)
         qpos = self.set_floating_base_qpos(base_qpos, qpos)
 
@@ -298,47 +344,84 @@ class GetUp(jump.Jump):
             )
             qpos = self.set_actuator_joints_qpos(initial_pose, qpos)
 
-        # In goal-only mode, mix complete face-down attempts with late-stage
-        # correction states.  Reference-guided training retains its existing
-        # reference-state initialization unchanged.
+        # In goal-only mode, mix complete attempts with easier recovery
+        # anchors. Reference-guided training retains its existing state init.
         reset_mode = jp.array(0, dtype=jp.int32)
         if not self._config.use_reference_motion:
-            reset_mix = jp.asarray(self._config.goal_only_reset_mix)
             reset_draw = jax.random.uniform(reset_mode_rng, ())
-            use_stuck_state = (reset_draw >= reset_mix[0]) & (
-                reset_draw < reset_mix[0] + reset_mix[1]
-            )
-            use_near_standing = reset_draw >= reset_mix[0] + reset_mix[1]
-
-            use_left_stuck = jax.random.bernoulli(stuck_side_rng)
-            stuck_qpos = jp.where(
-                use_left_stuck,
-                jp.asarray(LEFT_FOOT_STUCK_QPOS),
-                jp.asarray(RIGHT_FOOT_STUCK_QPOS),
-            )
-            stuck_qpos = stuck_qpos.at[:2].add(dxy)
-
             near_qpos = self._init_q
             near_base_qpos = self.get_floating_base_qpos(near_qpos)
             near_base_qpos = near_base_qpos.at[:2].set(dxy)
-            near_quat = near_base_qpos[3:7]
-            near_quat = math.quat_mul(
-                math.axis_angle_to_quat(jp.array([0.0, 0.0, 1.0]), yaw),
-                near_quat,
+            near_base_qpos = near_base_qpos.at[3:7].set(
+                perturb_quaternion(near_base_qpos[3:7])
             )
-            near_quat = math.quat_mul(
-                math.axis_angle_to_quat(jp.array([0.0, 1.0, 0.0]), pitch),
-                near_quat,
-            )
-            near_quat = math.quat_mul(
-                math.axis_angle_to_quat(jp.array([1.0, 0.0, 0.0]), roll),
-                near_quat,
-            )
-            near_base_qpos = near_base_qpos.at[3:7].set(near_quat)
             near_qpos = self.set_floating_base_qpos(near_base_qpos, near_qpos)
 
-            qpos = jp.where(use_stuck_state, stuck_qpos, qpos)
-            qpos = jp.where(use_near_standing, near_qpos, qpos)
+            if self._config.fallen_orientation == "back":
+                reset_mix = jp.asarray(self._config.back_getup_reset_mix)
+                side_boundary = reset_mix[0] + reset_mix[1]
+                crouch_boundary = side_boundary + reset_mix[2]
+                use_side_state = (reset_draw >= reset_mix[0]) & (
+                    reset_draw < side_boundary
+                )
+                use_crouch_state = (reset_draw >= side_boundary) & (
+                    reset_draw < crouch_boundary
+                )
+                use_near_standing = reset_draw >= crouch_boundary
+
+                side_index = jax.random.bernoulli(stuck_side_rng).astype(jp.int32)
+                side_qpos = self._init_q
+                side_base_qpos = self.get_floating_base_qpos(side_qpos)
+                side_base_qpos = side_base_qpos.at[:2].set(dxy)
+                side_base_qpos = side_base_qpos.at[2].set(SIDE_DOWN_ROOT_HEIGHT)
+                side_base_qpos = side_base_qpos.at[3:7].set(
+                    perturb_quaternion(jp.asarray(SIDE_DOWN_QUATS)[side_index])
+                )
+                side_qpos = self.set_floating_base_qpos(
+                    side_base_qpos, side_qpos
+                )
+
+                crouch_pos, crouch_quat = root_trajectory(
+                    CROUCH_REACHED, dxy, jp
+                )
+                crouch_qpos = self._init_q
+                crouch_base_qpos = self.get_floating_base_qpos(crouch_qpos)
+                crouch_base_qpos = crouch_base_qpos.at[:3].set(crouch_pos)
+                crouch_base_qpos = crouch_base_qpos.at[3:7].set(
+                    perturb_quaternion(crouch_quat)
+                )
+                crouch_qpos = self.set_floating_base_qpos(
+                    crouch_base_qpos, crouch_qpos
+                )
+                crouch_qpos = self.set_actuator_joints_qpos(
+                    trajectory_pose(CROUCH_REACHED, self._default_actuator, jp),
+                    crouch_qpos,
+                )
+
+                qpos = jp.where(use_side_state, side_qpos, qpos)
+                qpos = jp.where(use_crouch_state, crouch_qpos, qpos)
+                qpos = jp.where(use_near_standing, near_qpos, qpos)
+                reset_mode = jp.where(use_side_state, 1, reset_mode)
+                reset_mode = jp.where(use_crouch_state, 2, reset_mode)
+                reset_mode = jp.where(use_near_standing, 3, reset_mode)
+            else:
+                reset_mix = jp.asarray(self._config.goal_only_reset_mix)
+                use_stuck_state = (reset_draw >= reset_mix[0]) & (
+                    reset_draw < reset_mix[0] + reset_mix[1]
+                )
+                use_near_standing = reset_draw >= reset_mix[0] + reset_mix[1]
+                use_left_stuck = jax.random.bernoulli(stuck_side_rng)
+                stuck_qpos = jp.where(
+                    use_left_stuck,
+                    jp.asarray(LEFT_FOOT_STUCK_QPOS),
+                    jp.asarray(RIGHT_FOOT_STUCK_QPOS),
+                )
+                stuck_qpos = stuck_qpos.at[:2].add(dxy)
+                qpos = jp.where(use_stuck_state, stuck_qpos, qpos)
+                qpos = jp.where(use_near_standing, near_qpos, qpos)
+                reset_mode = jp.where(use_stuck_state, 1, reset_mode)
+                reset_mode = jp.where(use_near_standing, 2, reset_mode)
+
             initial_pose = self.get_actuator_joints_qpos(qpos)
             initial_pose = (
                 initial_pose
@@ -351,16 +434,6 @@ class GetUp(jump.Jump):
                 * self._qpos_noise_scale
             )
             qpos = self.set_actuator_joints_qpos(initial_pose, qpos)
-            reset_mode = jp.where(
-                use_stuck_state,
-                jp.array(1, dtype=jp.int32),
-                reset_mode,
-            )
-            reset_mode = jp.where(
-                use_near_standing,
-                jp.array(2, dtype=jp.int32),
-                reset_mode,
-            )
 
         qvel = self.set_floating_base_qvel(
             jax.random.uniform(vel_rng, (6,), minval=-0.03, maxval=0.03), qvel

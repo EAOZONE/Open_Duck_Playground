@@ -40,7 +40,8 @@ class OpenDuckMiniV2Runner(BaseRunner):
 
         self.env_config = self.env_file[0].default_config()
         if args.env == "getup":
-            use_reference_motion = not args.goal_only_getup
+            back_getup = getattr(args, "back_getup", False)
+            use_reference_motion = not args.goal_only_getup and not back_getup
             getup_ablation = getattr(args, "getup_ablation", "combined")
             training_config = getup.default_config()
             if use_reference_motion:
@@ -52,6 +53,14 @@ class OpenDuckMiniV2Runner(BaseRunner):
                     training_config, getup_ablation, training=True
                 )
                 training_config.reference_state_init_probability = 0.0
+                if back_getup:
+                    training_config.fallen_orientation = "back"
+                    back_stage = getattr(args, "back_getup_stage", "foundation")
+                    training_config.back_getup_reset_mix = (
+                        [0.0, 0.55, 0.30, 0.15]
+                        if back_stage == "foundation"
+                        else [0.55, 0.25, 0.15, 0.05]
+                    )
             self.env = getup.GetUp(task=args.task, config=training_config)
             # Evaluation is deliberately the harder, requested condition:
             # every episode starts face-down at phase zero.
@@ -61,8 +70,13 @@ class OpenDuckMiniV2Runner(BaseRunner):
                 eval_config.goal_only_reset_mix = [1.0, 0.0, 0.0]
             else:
                 configure_goal_only_getup(eval_config, getup_ablation, training=False)
+                if back_getup:
+                    eval_config.fallen_orientation = "back"
+                    eval_config.back_getup_reset_mix = [1.0, 0.0, 0.0, 0.0]
             self.eval_env = getup.GetUp(task=args.task, config=eval_config)
             mode = "reference-guided" if use_reference_motion else "goal-only"
+            if back_getup:
+                mode += f" back-start/{args.back_getup_stage}"
             suffix = "" if use_reference_motion else f" ({getup_ablation})"
             print(f"Get-up training mode: {mode}{suffix}")
         else:
@@ -153,6 +167,23 @@ def main() -> None:
         help=(
             "Train get-up directly from face-down to standing without a "
             "reference animation, phase signal, or moving pose target."
+        ),
+    )
+    parser.add_argument(
+        "--back-getup",
+        action="store_true",
+        help=(
+            "Fine-tune a goal-only get-up policy from randomized supine/back "
+            "resets while retaining late-stage standing curriculum states."
+        ),
+    )
+    parser.add_argument(
+        "--back-getup-stage",
+        choices=("foundation", "full"),
+        default="foundation",
+        help=(
+            "Back-get-up curriculum phase: learn side/crouch/stand first, "
+            "then introduce complete back-down recoveries."
         ),
     )
     parser.add_argument(

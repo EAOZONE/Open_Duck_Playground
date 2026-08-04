@@ -26,11 +26,21 @@ class PlayfulWalkCadenceTest(unittest.TestCase):
     def test_inference_cue_uses_existing_observation_slot(self) -> None:
         infer = MjInfer.__new__(MjInfer)
         infer.playful_policy = True
+        infer.playful_mode = True
         infer.gait_cycle = 2
         infer.commands = [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         infer._update_playful_policy_cue(moving=True)
         self.assertEqual(infer.commands[playful_walk.SKIP_COMMAND_INDEX], 0.5)
         infer._update_playful_policy_cue(moving=False)
+        self.assertEqual(infer.commands[playful_walk.SKIP_COMMAND_INDEX], 0.0)
+
+    def test_normal_mode_suppresses_the_accent_cue(self) -> None:
+        infer = MjInfer.__new__(MjInfer)
+        infer.playful_policy = True
+        infer.playful_mode = False
+        infer.gait_cycle = 2
+        infer.commands = [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        infer._update_playful_policy_cue(moving=True)
         self.assertEqual(infer.commands[playful_walk.SKIP_COMMAND_INDEX], 0.0)
 
 
