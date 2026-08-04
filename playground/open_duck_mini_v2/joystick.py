@@ -30,6 +30,7 @@ from mujoco_playground._src.collision import geoms_colliding
 
 from . import constants
 from . import base as open_duck_mini_v2_base
+from . import playful_walk
 
 # from playground.common.utils import LowPassActionFilter
 from playground.common.poly_reference_motion import PolyReferenceMotion
@@ -67,7 +68,15 @@ def _reference_motion_path() -> str:
 
 
 def _high_clearance_enabled() -> bool:
-    return os.environ.get("OPEN_DUCK_HIGH_CLEARANCE", "0").lower() in {
+    return _env_flag("OPEN_DUCK_HIGH_CLEARANCE") or _playful_walk_enabled()
+
+
+def _playful_walk_enabled() -> bool:
+    return _env_flag("OPEN_DUCK_PLAYFUL_WALK")
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "0").lower() in {
         "1",
         "true",
         "yes",
@@ -77,6 +86,7 @@ def _high_clearance_enabled() -> bool:
 
 def default_config() -> config_dict.ConfigDict:
     high_clearance = _high_clearance_enabled()
+    playful = _playful_walk_enabled()
     return config_dict.create(
         ctrl_dt=0.02,
         sim_dt=0.002,
@@ -119,7 +129,10 @@ def default_config() -> config_dict.ConfigDict:
             ),
             tracking_sigma=0.01,  # was working at 0.01
         ),
-        foot_height=0.045,
+        foot_height=playful_walk.NORMAL_FOOT_HEIGHT,
+        skip_foot_height=playful_walk.SKIP_FOOT_HEIGHT,
+        skip_every_gait_cycles=playful_walk.SKIP_EVERY_GAIT_CYCLES,
+        playful_walk=playful,
         push_config=config_dict.create(
             enable=True,
             interval_range=[5.0, 10.0],
@@ -161,6 +174,7 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
 
         self.use_imitation_reward = _imitation_enabled()
         self.high_clearance = _high_clearance_enabled()
+        self.playful_walk = _playful_walk_enabled()
         if self.use_imitation_reward:
             self.PRM = PolyReferenceMotion(
                 _reference_motion_path()
@@ -294,6 +308,8 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=ctrl)
         rng, cmd_rng = jax.random.split(rng)
         cmd = self.sample_command(cmd_rng)
+        if self.playful_walk:
+            cmd = cmd.at[playful_walk.SKIP_COMMAND_INDEX].set(0.0)
 
         # Sample push interval.
         rng, push_rng = jax.random.split(rng)
@@ -322,6 +338,7 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             "feet_air_time": jp.zeros(2),
             "last_contact": jp.zeros(2, dtype=bool),
             "swing_peak": jp.zeros(2),
+            "gait_cycle": jp.array(0, dtype=jp.int32),
             # Push related.
             "push": jp.array([0.0, 0.0]),
             "push_step": 0,
@@ -345,6 +362,11 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 else:
                     metrics[f"cost/{k}"] = jp.zeros(())
         metrics["swing_peak"] = jp.zeros(())
+        if self.playful_walk:
+            metrics["skip_cue"] = jp.zeros(())
+            metrics["desired_foot_height"] = jp.full(
+                (), self._config.foot_height
+            )
 
         contact = jp.array(
             [
@@ -359,10 +381,22 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
     def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
 
         if self.use_imitation_reward:
+            previous_i = state.info["imitation_i"]
             state.info["imitation_i"] += 1
             state.info["imitation_i"] = (
                 state.info["imitation_i"] % self.PRM.nb_steps_in_period
             )  # not critical, is already moduloed in get_reference_motion
+            phase_wrapped = state.info["imitation_i"] < previous_i
+            state.info["gait_cycle"] += phase_wrapped.astype(jp.int32)
+            if self.playful_walk:
+                skip_cue = playful_walk.skip_cue_for_cycle(
+                    state.info["gait_cycle"],
+                    jp,
+                    self._config.skip_every_gait_cycles,
+                )
+                state.info["command"] = state.info["command"].at[
+                    playful_walk.SKIP_COMMAND_INDEX
+                ].set(skip_cue)
             state.info["imitation_phase"] = jp.array(
                 [
                     jp.cos(
@@ -502,6 +536,15 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             self.sample_command(cmd_rng),
             state.info["command"],
         )
+        if self.playful_walk:
+            skip_cue = playful_walk.skip_cue_for_cycle(
+                state.info["gait_cycle"],
+                jp,
+                self._config.skip_every_gait_cycles,
+            )
+            state.info["command"] = state.info["command"].at[
+                playful_walk.SKIP_COMMAND_INDEX
+            ].set(skip_cue)
         state.info["step"] = jp.where(
             done | (state.info["step"] > 500),
             0,
@@ -518,6 +561,18 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 else:
                     state.metrics[f"cost/{k}"] = -v
         state.metrics["swing_peak"] = jp.mean(state.info["swing_peak"])
+        if self.playful_walk:
+            desired_height = playful_walk.desired_foot_heights(
+                state.info["gait_cycle"],
+                jp,
+                self._config.foot_height,
+                self._config.skip_foot_height,
+                self._config.skip_every_gait_cycles,
+            )
+            state.metrics["skip_cue"] = state.info["command"][
+                playful_walk.SKIP_COMMAND_INDEX
+            ]
+            state.metrics["desired_foot_height"] = jp.mean(desired_height)
 
         done = done.astype(reward.dtype)
         state = state.replace(data=data, obs=obs, reward=reward, done=done)
@@ -674,6 +729,18 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
     ) -> dict[str, jax.Array]:
         del metrics  # Unused.
 
+        desired_foot_height = (
+            playful_walk.desired_foot_heights(
+                info["gait_cycle"],
+                jp,
+                self._config.foot_height,
+                self._config.skip_foot_height,
+                self._config.skip_every_gait_cycles,
+            )
+            if self.playful_walk
+            else jp.full(2, self._config.foot_height)
+        )
+
         ret = {
             "tracking_lin_vel": reward_tracking_lin_vel(
                 info["command"],
@@ -711,7 +778,7 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             "feet_height": cost_feet_height(
                 info["swing_peak"],
                 first_contact,
-                self._config.foot_height,
+                desired_foot_height,
             ),
             "feet_air_time": reward_feet_air_time(
                 info["feet_air_time"],
@@ -723,9 +790,9 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                     jp.clip(
                         data.site_xpos[self._feet_site_id, -1],
                         0.0,
-                        self._config.foot_height,
+                        desired_foot_height,
                     )
-                    / self._config.foot_height
+                    / desired_foot_height
                     * (~contact).astype(jp.float32)
                 )
                 * (jp.linalg.norm(info["command"][:3]) > 0.01)

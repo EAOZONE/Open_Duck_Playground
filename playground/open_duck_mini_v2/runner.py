@@ -103,6 +103,18 @@ def main() -> None:
         default=None,
         help="Override PPO evaluation count.",
     )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="Override PPO learning rate.",
+    )
+    parser.add_argument(
+        "--entropy-cost",
+        type=float,
+        default=None,
+        help="Override PPO entropy cost.",
+    )
     parser.add_argument("--env", type=str, default="joystick", help="env")
     parser.add_argument("--task", type=str, default="flat_terrain", help="Task to run")
     parser.add_argument(
@@ -126,6 +138,14 @@ def main() -> None:
         "--high-clearance",
         action="store_true",
         help="Train a higher-foot-lift walking gait with commands up to 0.20 m/s.",
+    )
+    parser.add_argument(
+        "--playful-walk",
+        action="store_true",
+        help=(
+            "Fine-tune a 45 mm swing-height walk with one alternating 65 mm "
+            "accent step every three gait cycles."
+        ),
     )
     parser.add_argument(
         "--goal-only-getup",
@@ -155,6 +175,7 @@ def main() -> None:
         "0" if args.no_imitation_reward else "1"
     )
     os.environ["OPEN_DUCK_HIGH_CLEARANCE"] = "1" if args.high_clearance else "0"
+    os.environ["OPEN_DUCK_PLAYFUL_WALK"] = "1" if args.playful_walk else "0"
 
     runner = OpenDuckMiniV2Runner(args)
 

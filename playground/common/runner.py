@@ -101,6 +101,18 @@ class BaseRunner(ABC):
             self.ppo_params.num_envs = int(self.args.num_envs)
         if getattr(self.args, "num_evals", None) is not None:
             self.ppo_params.num_evals = int(self.args.num_evals)
+        if getattr(self.args, "learning_rate", None) is not None:
+            self.ppo_params.learning_rate = float(self.args.learning_rate)
+        if getattr(self.args, "entropy_cost", None) is not None:
+            self.ppo_params.entropy_cost = float(self.args.entropy_cost)
+        # Preserve a recovered walking gait while the freshly initialized
+        # critic catches up to the new clearance/accent rewards.
+        if getattr(self.args, "playful_walk", False):
+            if getattr(self.args, "learning_rate", None) is None:
+                self.ppo_params.learning_rate = 1.0e-4
+            if getattr(self.args, "entropy_cost", None) is None:
+                self.ppo_params.entropy_cost = 1.0e-3
+            self.ppo_params.clipping_epsilon = 0.1
         self.ppo_training_params = dict(self.ppo_params)
         # self.ppo_training_params["num_timesteps"] = 150000000 * 20
         

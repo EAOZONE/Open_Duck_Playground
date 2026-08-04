@@ -55,6 +55,44 @@ with `--head-bobble-amplitude`, `--antenna-wiggle-amplitude`, and
 settle, perform the excited hop, and return to walking. In Xbox mode, press B
 to request the same sequence; A remains the stop/dead-man control.
 
+## Playful high-step policy
+
+`--playful-walk` fine-tunes the normal walking task toward 45 mm foot
+clearance and one alternating 65 mm accent step every three gait cycles. The
+accent cue reuses the existing head-roll command slot, so the 101-observation,
+14-action walking network remains compatible with existing policies.
+
+An exported ONNX actor cannot directly resume PPO because it does not contain a
+critic or optimizer state. Reconstruct a compatible warm start from the actor
+weights and exact observation normalization with:
+
+```bash
+JAX_PLATFORMS=cpu uv run scripts/onnx_to_orbax_warmstart.py \
+  --onnx ../Open_Duck_Mini/BEST_WALK_ONNX.onnx \
+  --output checkpoints/warmstart_best_walk
+```
+
+Then fine-tune it with the conservative playful-walk PPO settings:
+
+```bash
+uv run playground/open_duck_mini_v2/runner.py \
+  --env joystick --task flat_terrain --playful-walk \
+  --restore_checkpoint_path checkpoints/warmstart_best_walk \
+  --output_dir checkpoints/playful_walk \
+  --num_timesteps 100000000 --num_evals 20
+```
+
+The selected 70.3M-step policy reached the highest evaluation reward in the
+100M-step run and is checked in as
+`playground/open_duck_mini_v2/models/playful_high_step_walk.onnx`. When running
+it, provide the same accent cue:
+
+```bash
+uv run playground/open_duck_mini_v2/mujoco_infer.py \
+  -o playground/open_duck_mini_v2/models/playful_high_step_walk.onnx \
+  --fixed-command 0.20 0 0 --playful-policy
+```
+
 ## Excited-hop policy
 
 The jump environment trains a short, one-shot excited hop with a 104-element

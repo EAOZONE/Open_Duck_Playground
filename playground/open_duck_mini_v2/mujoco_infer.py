@@ -10,6 +10,7 @@ from playground.common.utils import LowPassActionFilter
 
 from playground.open_duck_mini_v2.mujoco_infer_base import MJInferBase
 from playground.open_duck_mini_v2.jump_motion import JumpMotionController
+from playground.open_duck_mini_v2 import playful_walk
 
 USE_MOTOR_SPEED_LIMITS = True
 
@@ -42,6 +43,7 @@ class MjInfer(MJInferBase):
         latched_walk: bool = False,
         latched_forward_speed: float = DEFAULT_LATCHED_FORWARD_SPEED,
         expressive_walk: bool = False,
+        playful_policy: bool = False,
         head_bobble_amplitude: float = DEFAULT_HEAD_BOBBLE_AMPLITUDE,
         antenna_wiggle_amplitude: float = DEFAULT_ANTENNA_WIGGLE_AMPLITUDE,
         step_bounce_amplitude: float = DEFAULT_STEP_BOUNCE_AMPLITUDE,
@@ -55,6 +57,7 @@ class MjInfer(MJInferBase):
         self.latched_walk = latched_walk
         self.latched_forward_speed = float(latched_forward_speed)
         self.expressive_walk = expressive_walk
+        self.playful_policy = playful_policy
         self.head_bobble_amplitude = float(head_bobble_amplitude)
         self.antenna_wiggle_amplitude = float(antenna_wiggle_amplitude)
         self.step_bounce_amplitude = float(step_bounce_amplitude)
@@ -100,6 +103,7 @@ class MjInfer(MJInferBase):
         self.commands = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
         self.imitation_i = 0
+        self.gait_cycle = 0
         self.imitation_phase = np.array([0, 0])
         self.saved_obs = []
 
@@ -162,6 +166,17 @@ class MjInfer(MJInferBase):
         self.motor_targets[12] -= bounce
         self.motor_targets[4] += 0.35 * bounce
         self.motor_targets[13] += 0.35 * bounce
+
+    def _update_playful_policy_cue(self, moving: bool) -> None:
+        """Set the style cue consumed by a playful-walk policy."""
+        if not self.playful_policy:
+            return
+        cue = (
+            playful_walk.skip_cue_for_cycle(self.gait_cycle, np)
+            if moving
+            else 0.0
+        )
+        self.commands[playful_walk.SKIP_COMMAND_INDEX] = float(cue)
 
     def request_hop(self) -> bool:
         """Queue one hop when the walking controller is available."""
@@ -497,10 +512,13 @@ class MjInfer(MJInferBase):
                             and not self.standing
                             and not self.policy_only
                         ):
+                            previous_i = self.imitation_i
                             self.imitation_i += 1.0 * self.phase_frequency_factor
                             self.imitation_i = (
                                 self.imitation_i % self.PRM.nb_steps_in_period
                             )
+                            if self.imitation_i < previous_i:
+                                self.gait_cycle += 1
                             # print(self.PRM.nb_steps_in_period)
                             # exit()
                             self.imitation_phase = np.array(
@@ -519,6 +537,9 @@ class MjInfer(MJInferBase):
                                     ),
                                 ]
                             )
+
+                        moving = np.linalg.norm(self.commands[:3]) > 0.01
+                        self._update_playful_policy_cue(bool(moving))
 
                         walking_target = None
                         if self.motion_mode in ("walking", "settling"):
@@ -637,6 +658,14 @@ if __name__ == "__main__":
         help="Add an excited two-beat head bobble, antenna wiggle, and springy step.",
     )
     parser.add_argument(
+        "--playful-policy",
+        action="store_true",
+        help=(
+            "Drive the reserved alternating accent-step cue expected by a "
+            "policy trained with --playful-walk."
+        ),
+    )
+    parser.add_argument(
         "--head-bobble-amplitude",
         type=float,
         default=MjInfer.DEFAULT_HEAD_BOBBLE_AMPLITUDE,
@@ -668,6 +697,7 @@ if __name__ == "__main__":
         latched_walk=args.latched_walk,
         latched_forward_speed=args.latched_forward_speed,
         expressive_walk=args.expressive_walk,
+        playful_policy=args.playful_policy,
         head_bobble_amplitude=args.head_bobble_amplitude,
         antenna_wiggle_amplitude=args.antenna_wiggle_amplitude,
         step_bounce_amplitude=args.step_bounce_amplitude,
