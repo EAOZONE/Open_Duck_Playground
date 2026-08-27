@@ -3,6 +3,10 @@ import tensorflow as tf
 from tensorflow.keras import layers
 import tf2onnx
 import numpy as np
+import json
+import onnx
+
+from playground.common.motion_bundle import UNIFIED_OBSERVATION_SIZE, make_policy_manifest
 
 # ONNX export is small and does not need CUDA. Keeping TensorFlow on CPU avoids
 # competing with JAX for the GPU's cuBLAS/cuSolver workspace during training.
@@ -179,8 +183,20 @@ def export_onnx(
         tf_policy_network, input_signature=spec, opset=11, output_path=output_path
     )
 
+    if obs_size == UNIFIED_OBSERVATION_SIZE:
+        manifest = make_policy_manifest(np.asarray(mean), np.asarray(std))
+        metadata = model_proto.metadata_props.add()
+        metadata.key = "open_duck.policy_manifest"
+        metadata.value = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+        onnx.save(model_proto, output_path)
+
     # For Antoine :)
-    model_proto, _ = tf2onnx.convert.from_keras(
+    secondary_proto, _ = tf2onnx.convert.from_keras(
         tf_policy_network, input_signature=spec, opset=11, output_path="ONNX.onnx"
     )
+    if obs_size == UNIFIED_OBSERVATION_SIZE:
+        metadata = secondary_proto.metadata_props.add()
+        metadata.key = "open_duck.policy_manifest"
+        metadata.value = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+        onnx.save(secondary_proto, "ONNX.onnx")
     return

@@ -12,13 +12,16 @@ from flax.training import orbax_utils
 from tensorboardX import SummaryWriter
 
 import os
+import re
 from brax.training.agents.ppo import networks as ppo_networks, train as ppo
 from mujoco_playground import wrapper
 from mujoco_playground.config import locomotion_params
 from orbax import checkpoint as ocp
 import jax
+import numpy as np
 
 from playground.common.export_onnx import export_onnx
+from playground.common.training_video import TrainingVideoRecorder
 
 
 class BaseRunner(ABC):
@@ -41,6 +44,9 @@ class BaseRunner(ABC):
         self.obs_size = None
         self.num_timesteps = args.num_timesteps
         self.restore_checkpoint_path = None
+        self.step_offset = 0
+        self.video_env = None
+        self.video_recorder = None
         
         # CACHE STUFF
         os.makedirs(".tmp", exist_ok=True)
@@ -54,6 +60,7 @@ class BaseRunner(ABC):
         os.environ["JAX_COMPILATION_CACHE_DIR"] = ".tmp/jax_cache"
 
     def progress_callback(self, num_steps: int, metrics: dict) -> None:
+        num_steps += self.step_offset
 
         for metric_name, metric_value in metrics.items():
             # Convert to float, but watch out for 0-dim JAX arrays
@@ -62,6 +69,26 @@ class BaseRunner(ABC):
         success = metrics.get("eval/episode_success_steps")
         success_text = "" if success is None else f" success_steps: {success}"
         print("-----------", flush=True)
+
+    @staticmethod
+    def resolve_checkpoint_path(path: str | Path | None) -> str | None:
+        """Return the absolute Orbax path, rejecting a missing warm start."""
+
+        if path is None:
+            return None
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.exists():
+            raise FileNotFoundError(f"Checkpoint does not exist: {resolved}")
+        return resolved.as_posix()
+
+    @staticmethod
+    def checkpoint_step(path: str | Path | None) -> int:
+        """Read the environment-step suffix used by runner checkpoints."""
+
+        if path is None:
+            return 0
+        match = re.search(r"_(\d+)$", Path(path).name)
+        return int(match.group(1)) if match else 0
         print(
             f'STEP: {num_steps} reward: {metrics["eval/episode_reward"]} '
             f'reward_std: {metrics["eval/episode_reward_std"]}'
@@ -72,6 +99,8 @@ class BaseRunner(ABC):
 
     def policy_params_fn(self, current_step, make_policy, params):
         # save checkpoints
+
+        current_step += self.step_offset
 
         orbax_checkpointer = ocp.PyTreeCheckpointer()
         save_args = orbax_utils.save_args_from_target(params)
@@ -87,8 +116,49 @@ class BaseRunner(ABC):
             self.obs_size,  # may not work
             output_path=onnx_export_path
         )
+        if self.video_recorder is not None:
+            try:
+                result = self.video_recorder.record(current_step, make_policy, params)
+                if result is not None:
+                    self.writer.add_image(
+                        "eval/motion_video_preview",
+                        result.preview,
+                        current_step,
+                        dataformats="HWC",
+                    )
+                    self.writer.add_text(
+                        "eval/motion_video_path",
+                        result.path.as_posix(),
+                        current_step,
+                    )
+                    print(
+                        f"Saved {result.frame_count}-frame training video: {result.path}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                message = f"Training video recording failed at step {current_step}: {exc}"
+                if getattr(self.args, "video_strict", False):
+                    raise RuntimeError(message) from exc
+                print(f"WARNING: {message}", flush=True)
 
     def train(self) -> None:
+        self.restore_checkpoint_path = self.resolve_checkpoint_path(
+            self.restore_checkpoint_path
+        )
+        self.step_offset = self.checkpoint_step(self.restore_checkpoint_path)
+        target_total = getattr(self.args, "target_total_timesteps", None)
+        if target_total is not None:
+            if target_total <= self.step_offset:
+                raise ValueError(
+                    f"Target {target_total:,} is not beyond restored step "
+                    f"{self.step_offset:,}"
+                )
+            self.num_timesteps = int(target_total - self.step_offset)
+            print(
+                f"Resuming from global step {self.step_offset:,}; training "
+                f"{self.num_timesteps:,} remaining steps toward {target_total:,}.",
+                flush=True,
+            )
         self.ppo_params = locomotion_params.brax_ppo_config(
             "BerkeleyHumanoidJoystickFlatTerrain"
         )  # TODO
@@ -97,10 +167,35 @@ class BaseRunner(ABC):
         # PPO config; the jump task intentionally ends after its recovery
         # window.
         self.ppo_params.episode_length = int(self.env._config.episode_length)
+        if getattr(self.args, "video", False):
+            if self.video_env is None:
+                raise ValueError("periodic videos are only configured for motion_tracking")
+            self.video_recorder = TrainingVideoRecorder(
+                self.video_env,
+                self.output_dir,
+                interval_steps=self.args.video_interval_steps,
+                rollout_steps=self.args.video_length,
+                motions=self.args.video_motions,
+                fps=50.0,
+                width=self.args.video_width,
+                height=self.args.video_height,
+                camera=self.args.video_camera,
+            )
+        if getattr(self.args, "env", None) == "motion_tracking":
+            self.ppo_params.network_factory.policy_hidden_layer_sizes = (512, 256, 128)
+            self.ppo_params.network_factory.value_hidden_layer_sizes = (512, 256, 128)
+            if getattr(self.args, "num_envs", None) is None:
+                self.ppo_params.num_envs = 8192
         if getattr(self.args, "num_envs", None) is not None:
             self.ppo_params.num_envs = int(self.args.num_envs)
         if getattr(self.args, "num_evals", None) is not None:
             self.ppo_params.num_evals = int(self.args.num_evals)
+        elif getattr(self.args, "video", False):
+            # Brax invokes checkpoint/video callbacks only at eval boundaries.
+            # Choose enough boundaries to meet the requested video cadence.
+            self.ppo_params.num_evals = (
+                int(np.ceil(self.num_timesteps / self.args.video_interval_steps)) + 1
+            )
         if getattr(self.args, "learning_rate", None) is not None:
             self.ppo_params.learning_rate = float(self.args.learning_rate)
         if getattr(self.args, "entropy_cost", None) is not None:

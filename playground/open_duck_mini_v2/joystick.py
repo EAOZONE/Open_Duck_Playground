@@ -172,7 +172,9 @@ class Joystick(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             "home"
         ).ctrl  # ctrl of all the actual joints (no floating base and no backlash)
 
-        self.use_imitation_reward = _imitation_enabled()
+        self.use_imitation_reward = bool(
+            getattr(self._config, "use_imitation_reward", _imitation_enabled())
+        )
         self.high_clearance = _high_clearance_enabled()
         self.playful_walk = _playful_walk_enabled()
         if self.use_imitation_reward:

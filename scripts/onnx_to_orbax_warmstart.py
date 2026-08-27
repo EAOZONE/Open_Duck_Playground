@@ -82,13 +82,17 @@ def build_checkpoint_params(
     action_size: int,
     privileged_observation_size: int,
     statistics_count: float,
+    target_observation_size: int | None = None,
+    target_hidden_sizes: tuple[int, ...] | None = None,
 ):
     """Build the normalizer, recovered actor, and a fresh critic."""
-    state_size = int(mean.shape[0])
+    source_state_size = int(mean.shape[0])
+    state_size = target_observation_size or source_state_size
     hidden_names = sorted(layers, key=lambda name: int(name.rsplit("_", 1)[1]))
-    hidden_sizes = tuple(
+    source_hidden_sizes = tuple(
         int(layers[name]["bias"].shape[0]) for name in hidden_names[:-1]
     )
+    hidden_sizes = target_hidden_sizes or source_hidden_sizes
     expected_output = action_size * 2
     if int(layers[hidden_names[-1]]["bias"].shape[0]) != expected_output:
         raise ValueError(
@@ -112,30 +116,48 @@ def build_checkpoint_params(
     policy_params = ppo_network.policy_network.init(jax.random.PRNGKey(0))
     value_params = ppo_network.value_network.init(jax.random.PRNGKey(1))
 
-    for name in hidden_names:
+    target_names = sorted(policy_params["params"], key=lambda name: int(name.rsplit("_", 1)[1]))
+    for target_index, target_name in enumerate(target_names):
+        # Preserve all compatible blocks.  A widened/deeper actor keeps the
+        # old 101 observation rows and overlapping hidden units; newly added
+        # reference rows begin at zero so they do not perturb the warm start.
+        if target_index == len(target_names) - 1:
+            source_name = hidden_names[-1]
+        elif target_index < len(hidden_names) - 1:
+            source_name = hidden_names[target_index]
+        else:
+            continue
         for parameter in ("kernel", "bias"):
-            recovered = jp.asarray(layers[name][parameter], dtype=jp.float32)
-            expected_shape = policy_params["params"][name][parameter].shape
-            if recovered.shape != expected_shape:
-                raise ValueError(
-                    f"{name}/{parameter} shape {recovered.shape} does not match "
-                    f"current PPO shape {expected_shape}"
-                )
-            policy_params["params"][name][parameter] = recovered
+            source = np.asarray(layers[source_name][parameter], dtype=np.float32)
+            target = np.asarray(policy_params["params"][target_name][parameter]).copy()
+            if parameter == "kernel":
+                rows = min(source.shape[0], target.shape[0])
+                columns = min(source.shape[1], target.shape[1])
+                if target_index == 0 and state_size > source_state_size:
+                    target[source_state_size:, :] = 0.0
+                target[:rows, :columns] = source[:rows, :columns]
+            else:
+                width = min(source.shape[0], target.shape[0])
+                target[:width] = source[:width]
+            policy_params["params"][target_name][parameter] = jp.asarray(target)
 
     count = jp.asarray(statistics_count, dtype=jp.float32)
+    expanded_mean = np.zeros(state_size, dtype=np.float32)
+    expanded_std = np.ones(state_size, dtype=np.float32)
+    expanded_mean[:source_state_size] = mean
+    expanded_std[:source_state_size] = std
     normalizer = running_statistics.RunningStatisticsState(
         count=count,
         mean={
-            "state": jp.asarray(mean),
+            "state": jp.asarray(expanded_mean),
             "privileged_state": jp.zeros(privileged_observation_size),
         },
         summed_variance={
-            "state": jp.square(jp.asarray(std)) * count,
+            "state": jp.square(jp.asarray(expanded_std)) * count,
             "privileged_state": jp.ones(privileged_observation_size) * count,
         },
         std={
-            "state": jp.asarray(std),
+            "state": jp.asarray(expanded_std),
             "privileged_state": jp.ones(privileged_observation_size),
         },
     )
@@ -186,6 +208,19 @@ def main() -> None:
     parser.add_argument("--action-size", type=int, default=14)
     parser.add_argument("--privileged-observation-size", type=int, default=212)
     parser.add_argument(
+        "--target-observation-size",
+        type=int,
+        default=None,
+        help="Expand the actor input, zero-initializing all newly appended rows.",
+    )
+    parser.add_argument(
+        "--target-hidden-sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional widened/deeper policy and critic hidden sizes.",
+    )
+    parser.add_argument(
         "--statistics-count",
         type=float,
         default=150_000_000.0,
@@ -209,9 +244,12 @@ def main() -> None:
         action_size=args.action_size,
         privileged_observation_size=args.privileged_observation_size,
         statistics_count=args.statistics_count,
+        target_observation_size=args.target_observation_size,
+        target_hidden_sizes=(tuple(args.target_hidden_sizes) if args.target_hidden_sizes else None),
     )
-    max_error = verify_actor(onnx_path, normalizer, params, ppo_network)
-    if max_error > 1e-5:
+    expanded = args.target_observation_size is not None or args.target_hidden_sizes is not None
+    max_error = None if expanded else verify_actor(onnx_path, normalizer, params, ppo_network)
+    if max_error is not None and max_error > 1e-5:
         raise RuntimeError(f"Recovered actor differs from ONNX by {max_error:.3e}")
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -219,7 +257,10 @@ def main() -> None:
     save_args = orbax_utils.save_args_from_target(target)
     ocp.PyTreeCheckpointer().save(output.as_posix(), target, save_args=save_args)
     print(f"Saved warm-start checkpoint: {output}")
-    print(f"Recovered actor max absolute error: {max_error:.3e}")
+    if max_error is not None:
+        print(f"Recovered actor max absolute error: {max_error:.3e}")
+    else:
+        print("Expanded actor: copied overlapping source weights and zeroed new observation rows.")
     print(
         "Critic is freshly initialized; PPO will learn it while preserving "
         "the recovered actor and observation normalization."
